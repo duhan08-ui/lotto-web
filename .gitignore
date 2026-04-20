@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.streamlit/
+
+# Runtime artifacts
+# 로그/리포트는 GitHub 저장소에 함께 보존합니다.
+# 삭제/자동정리 대상이 아니므로 ignore 하지 않습니다.
+
+# Local secrets and environments
+.env
+.env.*
+venv/
+.venv/

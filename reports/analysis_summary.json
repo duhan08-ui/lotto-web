@@ -1,0 +1,66 @@
+{
+  "generated_at_utc": "2026-04-20T02:53:47+00:00",
+  "latest_source_round": 1220,
+  "next_target_round": 1221,
+  "resolved_match_rows": 0,
+  "time_series_rows": 0,
+  "daily_summary_rows": 1,
+  "weekly_summary_rows": 1,
+  "monthly_summary_rows": 1,
+  "weekday_summary_rows": 1,
+  "log_type_summary_rows": 1,
+  "recommended_threshold": null,
+  "best_round_example": null,
+  "log_file_status": [
+    {
+      "log_type": "prediction",
+      "file_name": "prediction_log.jsonl",
+      "records": 0,
+      "size_bytes": 0,
+      "size_kb": 0.0,
+      "last_saved_at": "-",
+      "path": "logs/prediction_log.jsonl"
+    },
+    {
+      "log_type": "probability",
+      "file_name": "probability_log.jsonl",
+      "records": 0,
+      "size_bytes": 0,
+      "size_kb": 0.0,
+      "last_saved_at": "-",
+      "path": "logs/probability_log.jsonl"
+    },
+    {
+      "log_type": "manual",
+      "file_name": "manual_score_log.jsonl",
+      "records": 0,
+      "size_bytes": 0,
+      "size_kb": 0.0,
+      "last_saved_at": "-",
+      "path": "logs/manual_score_log.jsonl"
+    },
+    {
+      "log_type": "analysis",
+      "file_name": "analysis_summary_log.jsonl",
+      "records": 14,
+      "size_bytes": 10204,
+      "size_kb": 9.965,
+      "last_saved_at": "2026-04-20T02:53:47+00:00",
+      "path": "logs/analysis_summary_log.jsonl"
+    }
+  ],
+  "artifacts": {
+    "prediction_actual_match_csv": "prediction_actual_match.csv",
+    "threshold_analysis_csv": "threshold_analysis.csv",
+    "score_timeseries_csv": "score_timeseries.csv",
+    "daily_summary_csv": "daily_log_summary.csv",
+    "weekly_summary_csv": "weekly_log_summary.csv",
+    "monthly_summary_csv": "monthly_log_summary.csv",
+    "weekday_summary_csv": "weekday_log_summary.csv",
+    "log_type_summary_csv": "log_type_summary.csv",
+    "score_timeseries_png": "score_timeseries.png",
+    "gap_factor_timeseries_png": "gap_factor_timeseries.png",
+    "summary_txt": "analysis_summary.txt"
+  },
+  "run_id": "analysis-20260420T025347+0000-45f19a95"
+}

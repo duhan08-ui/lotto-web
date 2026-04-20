@@ -1,0 +1,11 @@
+{
+  "counts": {
+    "prediction": 0,
+    "probability": 0,
+    "manual": 0
+  },
+  "unlock_granted": false,
+  "data_access_granted": false,
+  "updated_at": "2026-04-20T02:52:56+00:00",
+  "simulation_count": 5000
+}
