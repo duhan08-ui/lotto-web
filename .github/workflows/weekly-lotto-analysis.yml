@@ -1,0 +1,74 @@
+name: Weekly Lotto Update And Log Analysis
+# 수동 실행 전용 워크플로
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: lotto-update-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Update lotto.xlsx and analyze logs
+        run: python update_lotto.py
+
+      - name: Commit changed files
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          COMMIT_MESSAGE="chore: weekly lotto update and log analysis"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add lotto.xlsx logs reports
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "$COMMIT_MESSAGE"
+
+          for attempt in 1 2 3; do
+            echo "Push attempt $attempt"
+            if git push origin HEAD:"$BRANCH"; then
+              echo "Push succeeded"
+              exit 0
+            fi
+
+            echo "Push rejected, syncing with origin/$BRANCH and rebuilding once more..."
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            python update_lotto.py
+            git add lotto.xlsx logs reports
+
+            if git diff --cached --quiet; then
+              echo "No changes remain after syncing with origin."
+              exit 0
+            fi
+
+            git commit -m "$COMMIT_MESSAGE"
+            sleep 5
+          done
+
+          echo "Push failed after 3 attempts"
+          exit 1
