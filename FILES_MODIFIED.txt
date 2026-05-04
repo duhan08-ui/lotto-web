@@ -1,0 +1,15 @@
+# 수정된 파일 목록
+
+## 새로 추가된 파일
+- auto_log_generator.py (자동 로그 생성 모듈)
+- schedule_manager.py (스케줄 관리 모듈)
+- MODIFICATIONS_SUMMARY.md (수정 사항 요약)
+
+## 수정된 파일
+- analysis.py (분석 요약 로그 저장 제거)
+- app.py (스케줄 체크 기능 추가)
+
+## 변경 없음 (참고용)
+- log_utils.py (기존 persist_log_record 함수 활용)
+- history_analysis.py (변경 없음)
+- requirements.txt (변경 없음)

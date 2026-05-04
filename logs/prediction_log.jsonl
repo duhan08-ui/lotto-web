@@ -1,0 +1,35 @@
+{"target_round": 1223, "numbers": [3, 16, 19, 27, 36, 40], "score": 26.1599, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [6, 11, 19, 21, 38, 40], "score": 26.1487, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 6, 18, 27, 38, 42], "score": 26.1487, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 13, 23, 35, 38, 44], "score": 26.1386, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 6, 19, 23, 33, 42], "score": 26.134, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 16, 18, 27, 38, 42], "score": 26.1225, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 16, 18, 28, 39, 43], "score": 26.1192, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 4, 19, 26, 39, 43], "score": 26.1109, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 11, 16, 27, 39, 42], "score": 26.0903, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [1, 4, 19, 26, 38, 42], "score": 26.0831, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 4, 19, 21, 37, 45], "score": 26.079, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 16, 18, 24, 38, 45], "score": 26.071, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 11, 18, 21, 39, 45], "score": 26.0699, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 11, 25, 30, 37, 40], "score": 26.0525, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 4, 18, 27, 34, 43], "score": 26.0522, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 4, 18, 25, 33, 44], "score": 26.0477, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 4, 19, 24, 35, 44], "score": 26.0168, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 8, 19, 21, 34, 45], "score": 26.0067, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 7, 18, 24, 33, 45], "score": 26.0045, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 6, 18, 19, 38, 45], "score": 25.9958, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 7, 19, 26, 38, 43], "score": 25.9859, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 16, 18, 25, 38, 42], "score": 25.9561, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 15, 18, 21, 37, 44], "score": 25.9537, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 7, 18, 21, 37, 45], "score": 25.9325, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 11, 18, 23, 39, 42], "score": 25.9319, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 16, 24, 35, 38, 43], "score": 25.9029, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 16, 24, 27, 39, 45], "score": 25.9022, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 6, 19, 21, 33, 40], "score": 25.8913, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [3, 11, 18, 24, 39, 45], "score": 25.8872, "log_type": "prediction"}
+{"target_round": 1223, "numbers": [2, 16, 18, 23, 37, 45], "score": 25.8729, "log_type": "prediction"}
+{"timestamp": "2026-05-04T02:43:51+00:00", "source_round": 1221, "target_round": 1222, "candidate_rank": 1, "numbers": [3, 16, 19, 27, 36, 40], "score": 18.5, "log_type": "prediction", "is_intelligent": true, "record_uid": "3b0a9e718b1a48b0a1b9f7b944426983", "logged_at_utc": "2026-05-04T02:43:51+00:00"}
+{"timestamp": "2026-05-04T02:43:51+00:00", "source_round": 1221, "target_round": 1222, "candidate_rank": 2, "numbers": [3, 6, 18, 19, 38, 45], "score": 18.5, "log_type": "prediction", "is_intelligent": true, "record_uid": "2e8e85b423574b99b59a3bc612c2854e", "logged_at_utc": "2026-05-04T02:43:51+00:00"}
+{"timestamp": "2026-05-04T02:43:51+00:00", "source_round": 1221, "target_round": 1222, "candidate_rank": 3, "numbers": [6, 11, 19, 21, 38, 40], "score": 17.0, "log_type": "prediction", "is_intelligent": true, "record_uid": "32fe62f6948e431ca75f78a09808a459", "logged_at_utc": "2026-05-04T02:43:51+00:00"}
+{"timestamp": "2026-05-04T02:43:51+00:00", "source_round": 1221, "target_round": 1222, "candidate_rank": 4, "numbers": [3, 11, 25, 30, 37, 40], "score": 17.0, "log_type": "prediction", "is_intelligent": true, "record_uid": "c98c353ca5124f7b8ac6875a19d859cd", "logged_at_utc": "2026-05-04T02:43:51+00:00"}
+{"timestamp": "2026-05-04T02:43:51+00:00", "source_round": 1221, "target_round": 1222, "candidate_rank": 5, "numbers": [2, 6, 19, 21, 33, 40], "score": 17.0, "log_type": "prediction", "is_intelligent": true, "record_uid": "47304846bd6b4842b972b55ee7400e9a", "logged_at_utc": "2026-05-04T02:43:51+00:00"}

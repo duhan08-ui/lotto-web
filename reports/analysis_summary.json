@@ -1,0 +1,102 @@
+{
+  "generated_at_utc": "2026-05-04T01:43:41+00:00",
+  "latest_source_round": 1221,
+  "next_target_round": 1222,
+  "resolved_match_rows": 15,
+  "time_series_rows": 8,
+  "daily_summary_rows": 14,
+  "weekly_summary_rows": 9,
+  "monthly_summary_rows": 6,
+  "weekday_summary_rows": 10,
+  "log_type_summary_rows": 4,
+  "recommended_threshold": {
+    "threshold": -5.0,
+    "samples": 15.0,
+    "avg_hits": 0.8,
+    "hit_3_plus_rate": 0.0667,
+    "hit_4_plus_rate": 0.0,
+    "max_hits": 3.0,
+    "minimum_samples_rule": 5
+  },
+  "best_round_example": {
+    "target_round": 1221,
+    "log_type": "probability",
+    "score": -4.867,
+    "numbers": [
+      6,
+      8,
+      13,
+      29,
+      30,
+      45
+    ],
+    "actual_numbers": [
+      36,
+      18,
+      28,
+      6,
+      13,
+      30
+    ],
+    "bonus_number": 9,
+    "matched_numbers": [
+      6,
+      13,
+      30
+    ],
+    "prize_label": "5등",
+    "hit_count": 3
+  },
+  "log_file_status": [
+    {
+      "log_type": "prediction",
+      "file_name": "prediction_log.jsonl",
+      "records": 115,
+      "size_bytes": 64291,
+      "size_kb": 62.784,
+      "last_saved_at": "2026-05-03T23:11:08+00:00",
+      "path": "logs/prediction_log.jsonl"
+    },
+    {
+      "log_type": "probability",
+      "file_name": "probability_log.jsonl",
+      "records": 120,
+      "size_bytes": 67285,
+      "size_kb": 65.708,
+      "last_saved_at": "2026-05-03T23:11:10+00:00",
+      "path": "logs/probability_log.jsonl"
+    },
+    {
+      "log_type": "manual",
+      "file_name": "manual_score_log.jsonl",
+      "records": 1,
+      "size_bytes": 646,
+      "size_kb": 0.631,
+      "last_saved_at": "2026-04-22T02:33:19+00:00",
+      "path": "logs/manual_score_log.jsonl"
+    },
+    {
+      "log_type": "analysis",
+      "file_name": "analysis_summary_log.jsonl",
+      "records": 38,
+      "size_bytes": 39030,
+      "size_kb": 38.115,
+      "last_saved_at": "2026-04-29T07:06:37+00:00",
+      "path": "logs/analysis_summary_log.jsonl"
+    }
+  ],
+  "artifacts": {
+    "prediction_actual_match_csv": "prediction_actual_match.csv",
+    "threshold_analysis_csv": "threshold_analysis.csv",
+    "score_timeseries_csv": "score_timeseries.csv",
+    "daily_summary_csv": "daily_log_summary.csv",
+    "weekly_summary_csv": "weekly_log_summary.csv",
+    "monthly_summary_csv": "monthly_log_summary.csv",
+    "weekday_summary_csv": "weekday_log_summary.csv",
+    "log_type_summary_csv": "log_type_summary.csv",
+    "score_timeseries_png": "score_timeseries.png",
+    "gap_factor_timeseries_png": "gap_factor_timeseries.png",
+    "summary_txt": "analysis_summary.txt"
+  },
+  "run_id": "analysis-20260504T014341+0000-874e6678"
+}

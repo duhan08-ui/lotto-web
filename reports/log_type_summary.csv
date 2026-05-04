@@ -1,0 +1,5 @@
+﻿log_type,logs,unique_runs,unique_target_rounds,scored_logs,score_coverage,avg_score,median_score,score_std,best_score,p25_score,p75_score,avg_gap_factor,avg_probability_weight
+probability,120,5,2,120,1.0,-4.7916,-5.1751,1.7162,3.4907,-5.2088,-5.105,1.0091,1.01
+prediction,115,4,2,115,1.0,26.0328,26.5161,3.064,28.727,26.1208,27.0095,1.0199,1.1523
+analysis,38,38,3,0,0.0,,,,,,,,
+manual,1,1,1,1,1.0,-5.9388,-5.9388,0.0,-5.9388,-5.9388,-5.9388,1.0161,1.054
