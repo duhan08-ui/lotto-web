@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# ⚠️ Streamlit secrets - 절대 커밋 금지 (실제 credentials 포함)
+# Streamlit Cloud에서는 앱 설정 > Secrets 메뉴에서 직접 입력하세요.
+# 예시 파일: .streamlit/secrets.toml.example
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# 로컬 환경변수
+.env
+.env.*
+
+# 가상환경
+venv/
+.venv/
+
+# SQLite DB 파일 (런타임 생성, 커밋 불필요)
+*.db
+*.sqlite
+*.sqlite3
+
+# 런타임 로그 디렉토리 내용 (구조만 유지, 내용은 제외)
+logs/*
+!logs/.gitkeep
+
+# 파이썬 캐시
+*.coverage
+.coverage
+htmlcov/
+.pytest_cache/
