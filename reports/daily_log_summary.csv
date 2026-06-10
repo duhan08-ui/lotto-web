@@ -1,0 +1,2 @@
+﻿date_kst,log_type,logs,unique_runs,unique_target_rounds,scored_logs,score_coverage,avg_score,median_score,score_std,best_score,p25_score,p75_score,avg_gap_factor,avg_probability_weight
+2026-05-26,manual,5,0,1,5,1.0,8.5,8.5,0.7071,9.5,8.0,9.0,,

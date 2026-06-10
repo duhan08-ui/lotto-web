@@ -1,0 +1,140 @@
+{
+  "timestamp": "2026-06-01T01:41:46.881185",
+  "analysis_result": {
+    "rank3": 17,
+    "rank4": 11,
+    "rank5": 1
+  },
+  "recommendations": [
+    {
+      "rank": 1,
+      "numbers": [
+        9,
+        15,
+        18,
+        27,
+        32,
+        38
+      ],
+      "score": 127.0,
+      "ac": 7,
+      "sum": 139,
+      "odd_even": "3:3",
+      "hot_count": 4,
+      "winning_hit": 6
+    },
+    {
+      "rank": 2,
+      "numbers": [
+        10,
+        15,
+        18,
+        25,
+        27,
+        38
+      ],
+      "score": 122.0,
+      "ac": 10,
+      "sum": 133,
+      "odd_even": "3:3",
+      "hot_count": 3,
+      "winning_hit": 5
+    },
+    {
+      "rank": 3,
+      "numbers": [
+        2,
+        9,
+        15,
+        18,
+        27,
+        31
+      ],
+      "score": 122.0,
+      "ac": 7,
+      "sum": 102,
+      "odd_even": "4:2",
+      "hot_count": 3,
+      "winning_hit": 5
+    },
+    {
+      "rank": 4,
+      "numbers": [
+        6,
+        9,
+        15,
+        18,
+        28,
+        32
+      ],
+      "score": 122.0,
+      "ac": 8,
+      "sum": 108,
+      "odd_even": "2:4",
+      "hot_count": 4,
+      "winning_hit": 5
+    },
+    {
+      "rank": 5,
+      "numbers": [
+        9,
+        25,
+        28,
+        32,
+        34,
+        38
+      ],
+      "score": 122.0,
+      "ac": 8,
+      "sum": 166,
+      "odd_even": "2:4",
+      "hot_count": 3,
+      "winning_hit": 5
+    }
+  ],
+  "formula_info": {
+    "version": "2.0",
+    "focus": "4/5등 보장 + 대박 가능성",
+    "hot_numbers": [
+      27,
+      28,
+      15,
+      9,
+      16,
+      3,
+      38,
+      37,
+      19,
+      7,
+      8,
+      6,
+      33,
+      39,
+      13
+    ],
+    "winning_hot": [
+      28,
+      18,
+      31,
+      9,
+      27,
+      38,
+      25,
+      15,
+      32,
+      20
+    ],
+    "cold_numbers": [
+      10,
+      26,
+      40,
+      41,
+      42,
+      32,
+      4,
+      2,
+      23,
+      18
+    ]
+  }
+}
