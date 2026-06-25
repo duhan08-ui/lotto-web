@@ -1,0 +1,13 @@
+{
+  "layer1_prediction_feedback": [],
+  "layer2_winning_pattern_stats": {
+    "recent_count": 0,
+    "avg_sum": 138.4,
+    "avg_high_count": 1.8,
+    "avg_odd_count": 3.0,
+    "avg_consecutive_pairs": 0.8,
+    "high_range_ratio": 0.6
+  },
+  "layer3_today_candidates": [],
+  "generated_at": "2026-05-29T01:15:46+00:00"
+}

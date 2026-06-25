@@ -1,0 +1,5 @@
+﻿date_kst,log_type,logs,unique_runs,unique_target_rounds,scored_logs,score_coverage,avg_score,median_score,score_std,best_score,p25_score,p75_score,avg_gap_factor,avg_probability_weight
+2026-06-15,manual,6,6,1,6,1.0,0.5421,0.1787,2.2625,4.5747,-0.2174,1.2789,0.9922,1.0197
+2026-06-09,manual,160,100,1,160,1.0,1.012,0.6746,2.3294,6.7145,0.5813,2.4009,0.992,1.0011
+2026-06-09,prediction,160,1,1,160,1.0,274.4064,429.4067,212.2281,481.6133,0.67,438.7247,0.9844,1.0063
+2026-06-09,probability,160,1,1,160,1.0,-1.4193,-2.6035,1.6137,0.7123,-2.7141,0.6598,0.9882,1.0013

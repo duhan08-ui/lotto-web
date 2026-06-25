@@ -1,0 +1,75 @@
+{
+  "generated_at_utc": "2026-06-14T23:57:27+00:00",
+  "latest_source_round": 1226,
+  "next_target_round": 1229,
+  "resolved_match_rows": 0,
+  "time_series_rows": 4,
+  "daily_summary_rows": 4,
+  "weekly_summary_rows": 4,
+  "monthly_summary_rows": 3,
+  "weekday_summary_rows": 4,
+  "log_type_summary_rows": 3,
+  "recommended_threshold": null,
+  "best_round_example": null,
+  "log_file_status": [
+    {
+      "log_type": "prediction",
+      "file_name": "prediction_log.jsonl",
+      "records": 160,
+      "size_bytes": 57714,
+      "size_kb": 56.361,
+      "last_saved_at": "2026-06-09T04:38:54+00:00",
+      "path": "logs/prediction_log.jsonl"
+    },
+    {
+      "log_type": "probability",
+      "file_name": "probability_log.jsonl",
+      "records": 160,
+      "size_bytes": 57815,
+      "size_kb": 56.46,
+      "last_saved_at": "2026-06-09T04:38:54+00:00",
+      "path": "logs/probability_log.jsonl"
+    },
+    {
+      "log_type": "manual",
+      "file_name": "manual_score_log.jsonl",
+      "records": 166,
+      "size_bytes": 68854,
+      "size_kb": 67.24,
+      "last_saved_at": "2026-06-14T23:55:41+00:00",
+      "path": "logs/manual_score_log.jsonl"
+    },
+    {
+      "log_type": "analysis",
+      "file_name": "analysis_summary_log.jsonl",
+      "records": 0,
+      "size_bytes": 0,
+      "size_kb": 0.0,
+      "last_saved_at": "-",
+      "path": "logs/analysis_summary_log.jsonl"
+    },
+    {
+      "log_type": "top5",
+      "file_name": "top5_log.jsonl",
+      "records": 0,
+      "size_bytes": 0,
+      "size_kb": 0.0,
+      "last_saved_at": "-",
+      "path": "logs/top5_log.jsonl"
+    }
+  ],
+  "artifacts": {
+    "prediction_actual_match_csv": "prediction_actual_match.csv",
+    "threshold_analysis_csv": "threshold_analysis.csv",
+    "score_timeseries_csv": "score_timeseries.csv",
+    "daily_summary_csv": "daily_log_summary.csv",
+    "weekly_summary_csv": "weekly_log_summary.csv",
+    "monthly_summary_csv": "monthly_log_summary.csv",
+    "weekday_summary_csv": "weekday_log_summary.csv",
+    "log_type_summary_csv": "log_type_summary.csv",
+    "score_timeseries_png": "score_timeseries.png",
+    "gap_factor_timeseries_png": "gap_factor_timeseries.png",
+    "summary_txt": "analysis_summary.txt"
+  },
+  "run_id": "analysis-20260614T235727+0000-912c43a9"
+}

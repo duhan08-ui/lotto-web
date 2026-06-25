@@ -1,0 +1,12 @@
+# [v69] 다크 테마 고정.
+# 이 설정이 없으면 base 테마가 'light' 라서 날짜 선택 달력 팝업이
+# 흰색으로 떠 앱(다크)과 어긋난다. base="dark" 로 네이티브 위젯까지 통일.
+[theme]
+base = "dark"
+primaryColor = "#38bdf8"
+backgroundColor = "#081120"
+secondaryBackgroundColor = "#13223a"
+textColor = "#e6edf7"
+
+[client]
+showErrorDetails = true

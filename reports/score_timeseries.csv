@@ -1,0 +1,5 @@
+﻿date,log_type,avg_score,avg_gap_factor,samples
+2026-06-09,manual,1.012,0.991985,160
+2026-06-09,prediction,274.4064,0.984439,160
+2026-06-09,probability,-1.4193,0.988161,160
+2026-06-14,manual,0.5421,0.992166,6
