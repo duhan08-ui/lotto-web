@@ -1,0 +1,5912 @@
+from __future__ import annotations
+
+import ast
+import calendar
+import math
+import os
+import random
+from collections import Counter
+from datetime import date, datetime, timedelta
+from itertools import permutations
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# .env 파일 로드 (로컬 개발용)
+from dotenv import load_dotenv
+_project_root = Path(__file__).resolve().parent
+load_dotenv(_project_root / ".env", override=True)
+
+
+def _resolve_data_dir() -> Path:
+    """런타임 데이터(logs, reports) 쓰기 경로 결정.
+
+    우선순위:
+    1. 환경변수 LOTTO_DATA_DIR
+    2. 앱 소스 디렉터리가 쓰기 가능하면 그대로 사용
+    3. /tmp/lotto_data (Streamlit Cloud 등 읽기전용 환경 fallback)
+    """
+    env_dir = os.getenv("LOTTO_DATA_DIR", "").strip()
+    if env_dir:
+        p = Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # 소스 디렉터리가 쓰기 가능한지 확인
+    test_path = _project_root / "logs" / ".write_test"
+    try:
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.touch()
+        test_path.unlink()
+        return _project_root
+    except (OSError, PermissionError):
+        pass
+
+    # Streamlit Cloud / 읽기전용 환경 fallback
+    fallback = Path("/tmp/lotto_data")
+    fallback.mkdir(parents=True, exist_ok=True)
+    # lotto.xlsx는 소스에서 복사 (logs 처리용으로 필요)
+    src_excel = _project_root / "lotto.xlsx"
+    dst_excel = fallback / "lotto.xlsx"
+    if src_excel.exists() and not dst_excel.exists():
+        import shutil
+        shutil.copy2(src_excel, dst_excel)
+    return fallback
+
+import pandas as pd
+import streamlit as st
+
+# --- [v69 fix] 모든 st.dataframe 렌더를 Arrow-safe 로 강제 ---------------------
+# 후보순위 등 object 컬럼에 정수와 '-'(str)가 섞이면 pyarrow 직렬화가 실패하고
+# Streamlit 이 매 렌더마다 타입 재추론(automatic fixes)을 수행해 화면이 느려진다.
+# st.dataframe 을 감싸 object 컬럼을 문자열로 통일하여 근본적으로 차단한다.
+_orig_st_dataframe = st.dataframe
+
+
+def _arrow_safe_dataframe(data=None, *args, **kwargs):
+    if isinstance(data, pd.DataFrame):
+        # [성능] object 컴럼이 있을 때만 복사/문자열 변환한다.
+        # object 컴럼이 없으면 매 렌더마다 불필요한 .copy() 를 피한다.
+        object_cols = [c for c in data.columns if data[c].dtype == object]
+        if object_cols:
+            data = data.copy()
+            for _col in object_cols:
+                data[_col] = data[_col].map(lambda v: "" if v is None else str(v))
+    return _orig_st_dataframe(data, *args, **kwargs)
+
+
+st.dataframe = _arrow_safe_dataframe
+# ---------------------------------------------------------------------------
+
+# --- [진단] 메모리 사용량 로깅 ------------------------------------------------
+# Streamlit Community Cloud 는 메모리 그래프를 제공하지 않으므로,
+# 앱이 직접 피크 RSS(최대 메모리)를 로그에 찍어 OOM(Bus error/SIGBUS) 여부를
+# 확인할 수 있게 한다. 표준 라이브러리(resource)만 사용한다.
+def _log_mem(tag: str) -> None:
+    try:
+        import resource
+        kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # Linux: KB 단위
+        print(f"[MEM] {tag}: peak RSS ~{kb / 1024.0:.0f} MB", flush=True)
+    except Exception:
+        pass
+
+
+_log_mem("module import 완료")
+# ---------------------------------------------------------------------------
+
+from ai_ui_utils import render_ai_recommendation_section
+from reports.dashboard_cards import render_performance_dashboard
+
+from analysis import analyze_logs
+from anti_pattern_lotto import generate_prime_composite_stats_ticket
+from history_analysis import (
+    build_log_type_summary as build_history_log_type_summary,
+    build_period_summary as build_history_period_summary,
+    enrich_history_dataframe,
+)
+from log_utils import (
+    LOG_FILE_MAP,
+    REPORT_FILE_MAP,
+    build_log_status_table,
+    ensure_runtime_dirs,
+    load_app_state,
+    load_combined_log_history,
+    log_manual_score,
+    log_prediction_results,
+    save_app_state,
+    bootstrap_remote_runtime_if_needed,
+    set_defer_remote_bootstrap,
+)
+from update_lotto import update_excel
+# schedule_manager는 웹 로그인 없이 독립 실행 시에만 사용
+# from schedule_manager import check_and_run_if_needed
+
+# --- 설정 및 상수 ---
+TITLE = "Data Algorithm Intelligence"
+SUBTITLE = "데이터 알고리즘 인텔리전스: 통계적 패턴과 수치 흐름을 시뮬레이션하는 지능형 분석 플랫폼"
+LOCK_LIMIT = 3
+DEFAULT_SIMULATION_COUNT = int(os.getenv("LOTTO_SIMULATION_COUNT", "5000"))
+SIMULATION_COUNT = DEFAULT_SIMULATION_COUNT
+def _load_secret(key: str, env_key: str, default: str) -> str:
+    """st.secrets → 환경변수 → 기본값 순서로 비밀값 로드."""
+    try:
+        return str(st.secrets[key])
+    except (KeyError, FileNotFoundError):
+        return os.getenv(env_key, default)
+
+SIMULATION_EDIT_PASSWORD = _load_secret("SIMULATION_EDIT_PASSWORD", "LOTTO_SIMULATION_EDIT_PASSWORD", "")
+SIMULATION_PANEL_VARIANT = "A"
+DATA_CHECK_PASSWORD = _load_secret("DATA_CHECK_PASSWORD", "LOTTO_DATA_CHECK_PASSWORD", "")
+UNLOCK_PASSWORD = _load_secret("UNLOCK_PASSWORD", "LOTTO_UNLOCK_PASSWORD", "")
+KST = ZoneInfo("Asia/Seoul")
+LIMIT_TARGETS = ("prediction", "probability")
+ARTIFACT_LABEL_MAP = {
+    "prediction_actual_match_csv": "예측-실제 적중 매칭",
+    "threshold_analysis_csv": "임계값 분석",
+    "score_timeseries_csv": "점수 시계열",
+    "score_timeseries_png": "점수 추이 차트",
+    "gap_factor_timeseries_png": "gap 계수 추이 차트",
+    "daily_summary_csv": "일별 통계 요약",
+    "weekly_summary_csv": "주별 통계 요약",
+    "monthly_summary_csv": "월별 통계 요약",
+    "weekday_summary_csv": "요일별 통계 요약",
+    "log_type_summary_csv": "로그 유형 통계 요약",
+    "summary_txt": "분석 요약 텍스트",
+    "summary_json": "분석 요약 JSON",
+}
+
+
+def _validate_secrets() -> list[str]:
+    """환경변수/secrets가 설정되지 않은 필수 패스워드를 반환."""
+    missing = []
+    if not SIMULATION_EDIT_PASSWORD:
+        missing.append("SIMULATION_EDIT_PASSWORD (env: LOTTO_SIMULATION_EDIT_PASSWORD)")
+    if not DATA_CHECK_PASSWORD:
+        missing.append("DATA_CHECK_PASSWORD (env: LOTTO_DATA_CHECK_PASSWORD)")
+    if not UNLOCK_PASSWORD:
+        missing.append("UNLOCK_PASSWORD (env: LOTTO_UNLOCK_PASSWORD)")
+    return missing
+
+
+
+def _today_password() -> str:
+    """오늘 날짜 기반 입장 비밀번호 반환 (MMDD 형식)"""
+    return datetime.now(KST).strftime("%m%d")
+
+
+def _file_cache_token(path: Path | str) -> tuple[str, int, int]:
+    file_path = Path(path)
+    if not file_path.exists():
+        return (str(file_path), 0, 0)
+    stat = file_path.stat()
+    return (str(file_path.resolve()), stat.st_mtime_ns, stat.st_size)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_cached_predictor(excel_path_str: str, cache_token: tuple[str, int, int]) -> "LottoPredictor":
+    return LottoPredictor(excel_path_str)
+
+
+@st.cache_data(show_spinner=False)
+def _read_excel_cached(excel_path_str: str, cache_token: tuple[str, int, int]) -> pd.DataFrame:
+    return pd.read_excel(excel_path_str)
+
+
+
+def _sanitize_simulation_count(value: int | str | None) -> int:
+    try:
+        count = int(value or DEFAULT_SIMULATION_COUNT)
+    except (TypeError, ValueError):
+        count = DEFAULT_SIMULATION_COUNT
+    return max(1000, min(count, 50000))
+
+
+def _current_simulation_count() -> int:
+    return _sanitize_simulation_count(st.session_state.get("simulation_count", DEFAULT_SIMULATION_COUNT))
+
+
+def _current_source_round(
+    excel_path: Path,
+    cache_token: tuple[str, int, int],
+    predictor: "LottoPredictor" | None = None,
+) -> int:
+    fallback = int(getattr(predictor, "total_draws", 0) or 0)
+    try:
+        df = _read_excel_cached(str(excel_path), cache_token)
+    except Exception:
+        return fallback
+
+    if df.empty:
+        return fallback
+    if "회차" not in df.columns:
+        return fallback or int(len(df))
+
+    rounds = pd.to_numeric(df["회차"], errors="coerce").dropna()
+    if rounds.empty:
+        return fallback or int(len(df))
+    return int(rounds.max())
+
+
+def _analysis_dependency_signature(project_dir: Path, excel_path: Path, cache_token: tuple[str, int, int]) -> tuple:
+    log_dir = project_dir / "logs"
+    signatures = [cache_token]
+    for file_name in LOG_FILE_MAP.values():
+        signatures.append(_file_cache_token(log_dir / file_name))
+    return tuple(signatures)
+
+
+@st.cache_data(show_spinner=False)
+def _analyze_logs_cached(project_dir_str: str, excel_path_str: str, signature: tuple) -> dict:
+    """[성능] analyze_logs 결과를 프로세스 단위로 캐시한다.
+
+    기존엔 세션마다(st.session_state) 한 번씩 analyze_logs 를 돌려, 새 방문자/
+    새 세션이 생길 때마다 SQLite 적재·엑셀 파싱·matplotlib 차트 생성에 2초 이상이
+    걸렸다. 파일 변경 시그니처를 키로 사용해 데이터가 바뀔 때만 재계산하고,
+    그렇지 않으면 모든 세션이 캐시된 결과를 공유한다.
+    """
+    return analyze_logs(Path(project_dir_str), Path(excel_path_str))
+
+
+def _get_fresh_analysis_summary(
+    project_dir: Path,
+    excel_path: Path,
+    cache_token: tuple[str, int, int],
+    predictor: "LottoPredictor" | None = None,
+    *,
+    force_refresh: bool = False,
+) -> dict:
+    summary = st.session_state.get("analysis_summary")
+    stored_signature = st.session_state.get("analysis_signature")
+    latest_source_round = _current_source_round(excel_path, cache_token, predictor)
+    current_signature = _analysis_dependency_signature(project_dir, excel_path, cache_token)
+
+    summary_round = None
+    if isinstance(summary, dict):
+        try:
+            summary_round = int(summary.get("latest_source_round"))
+        except (TypeError, ValueError):
+            summary_round = None
+
+    needs_refresh = force_refresh or not isinstance(summary, dict) or stored_signature != current_signature or summary_round != latest_source_round
+    if needs_refresh:
+        if force_refresh:
+            # 강제 새로고침 시에는 캐시를 우회해 항상 재계산한다.
+            summary = analyze_logs(project_dir, excel_path)
+        else:
+            summary = _analyze_logs_cached(str(project_dir), str(excel_path), current_signature)
+        st.session_state.analysis_summary = summary
+        st.session_state.analysis_signature = _analysis_dependency_signature(project_dir, excel_path, cache_token)
+    return st.session_state.get("analysis_summary") or {}
+
+
+def _generate_anti_pattern_manual_numbers(excel_path: Path, previous_numbers: list[int] | None = None) -> list[int]:
+    previous_tuple = tuple(sorted(int(n) for n in previous_numbers)) if previous_numbers else None
+    rng = random.SystemRandom()
+    latest_candidate: list[int] = []
+    for _ in range(12):
+        seed = rng.randint(1, 10**9)
+        latest_candidate = list(generate_prime_composite_stats_ticket(excel_path=excel_path, seed=seed))
+        if previous_tuple is None or tuple(latest_candidate) != previous_tuple:
+            return latest_candidate
+    return latest_candidate
+
+
+def _refresh_source_data(excel_path: Path) -> dict:
+    try:
+        final_df, mode = update_excel(excel_path)
+        latest_round = int(final_df.iloc[0]["회차"]) if not final_df.empty else 0
+        # [성능] 데이터가 실제로 바뀐 경우(incremental/full)에만 캐시를 비운다.
+        # 예전엔 noop(새 데이터 없음)에도 무조건 cache_resource 까지 비워서,
+        # 매 세션 첫 로드마다 predictor(마르코프·백테스트·앙상블)를 헛되이 재빌드 →
+        # 로딩이 느렸다. noop 이면 캐시를 유지해 즉시 재사용한다.
+        if mode in ("incremental", "full"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.analysis_summary = None
+            st.session_state.analysis_signature = None
+        if mode == "incremental":
+            message = f"원본 데이터를 최신 회차까지 갱신했습니다. 현재 {latest_round}회차 기준입니다."
+            level = "success"
+        elif mode == "full":
+            message = f"원본 데이터를 전체 재수집해 최신 회차까지 갱신했습니다. 현재 {latest_round}회차 기준입니다."
+            level = "success"
+        else:
+            message = f"이미 최신 데이터입니다. 현재 {latest_round}회차 기준입니다."
+            level = "info"
+    except Exception as exc:
+        message = f"원본 데이터 최신화 중 오류가 발생했습니다: {exc}"
+        level = "error"
+
+    notice = {"level": level, "message": message}
+    st.session_state.source_data_refresh_notice = notice
+    return notice
+
+
+# 원본 데이터 스크래핑(update_excel) 재실행 최소 간격(초). 세션 플래그와 함께 사용해
+# 새 세션/스크립트 재실행마다 웹 스크래핑이 반복되어 로딩이 느려지는 것을 막는다.
+_SOURCE_REFRESH_MIN_INTERVAL_SEC = 600.0
+_source_refresh_state = {"last_mono": 0.0}
+
+
+def _maybe_refresh_source_data(excel_path: Path) -> None:
+    """세션당 1회 + 프로세스 단위 최소 간격으로만 원본 데이터 갱신을 수행한다."""
+    import time as _time
+    if st.session_state.get("_source_data_refreshed"):
+        return
+    now = _time.monotonic()
+    last = _source_refresh_state["last_mono"]
+    if last > 0 and (now - last) < _SOURCE_REFRESH_MIN_INTERVAL_SEC:
+        # 최근에 이미 갱신됨 → 이번 세션은 스크래핑을 생략하고 기존 데이터를 재사용
+        st.session_state["_source_data_refreshed"] = True
+        return
+    try:
+        _refresh_source_data(excel_path)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"데이터 업데이트 중 오류: {e}")
+    finally:
+        st.session_state["_source_data_refreshed"] = True
+        _source_refresh_state["last_mono"] = now
+
+
+def disable_copy():
+    st.markdown(
+        """
+        <style>
+        @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
+        :root {
+            --text-main: #201E1A;
+            --text-sub: #6A655C;
+            --line-soft: rgba(28,25,20,0.10);
+            --line-glow: rgba(45,74,107,0.22);
+            --shadow-soft: 0 1px 2px rgba(28,25,20,0.05), 0 10px 30px -16px rgba(28,25,20,0.14);
+            --panel-top: rgba(255,255,255,0.92);
+            --panel-bottom: rgba(255,255,255,0.92);
+        }
+        html, body, [data-testid="stAppViewContainer"] {
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+            background: #F7F5F0;
+            color: var(--text-main);
+        }
+        canvas { pointer-events: none; }
+        .block-container {
+            padding-top: 1.6rem;
+            padding-bottom: 3rem;
+            max-width: 1240px;
+        }
+        h1, h2, h3, h4, p, li, span, label, div {
+            color: var(--text-main);
+        }
+        [data-testid="stHeader"] {
+            background: rgba(0,0,0,0);
+        }
+        [data-testid="stToolbar"] {
+            right: 0.75rem;
+            display: none !important;
+            visibility: hidden !important;
+        }
+        [data-testid="stToolbarActions"],
+        [data-testid="stToolbarActionButton"],
+        #MainMenu,
+        #GithubIcon,
+        [class*="viewerBadge"],
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+            visibility: hidden !important;
+        }
+        [data-testid="stMetricValue"] { color: #201E1A; }
+        [data-testid="stMetricLabel"] { color: var(--text-sub); }
+        div[data-baseweb="tab-list"] {
+            gap: 10px;
+            margin-bottom: 0.6rem;
+            overflow-x: auto;
+            overflow-y: hidden;
+            flex-wrap: nowrap;
+            scrollbar-width: thin;
+        }
+        button[role="tab"] {
+            border-radius: 999px !important;
+            padding: 10px 16px !important;
+            background: rgba(255,255,255,0.04) !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+            color: #201E1A !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+            white-space: nowrap;
+            flex: 0 0 auto;
+        }
+        button[role="tab"][aria-selected="true"] {
+            background: linear-gradient(135deg, rgba(56,189,248,0.22), rgba(167,139,250,0.24)) !important;
+            border-color: rgba(125,211,252,0.32) !important;
+            color: #201E1A !important;
+        }
+        .stButton > button,
+        .stDownloadButton > button,
+        .stFormSubmitButton > button {
+            border-radius: 16px;
+            border: 1px solid rgba(148,163,184,0.18);
+            background: linear-gradient(180deg, rgba(19,34,58,0.98), rgba(10,20,36,0.98));
+            color: #201E1A;
+            font-weight: 600;
+            min-height: 48px;
+            box-shadow: 0 14px 30px rgba(2,8,23,0.24);
+            transition: all 0.18s ease;
+        }
+        .stButton > button:hover,
+        .stDownloadButton > button:hover,
+        .stFormSubmitButton > button:hover {
+            border-color: rgba(125,211,252,0.34);
+            background: linear-gradient(180deg, rgba(25,45,74,0.98), rgba(11,22,39,0.98));
+            transform: translateY(-1px);
+        }
+        .stButton > button[kind="primary"] {
+            border: 1px solid rgba(103,232,249,0.34) !important;
+            background: linear-gradient(135deg, rgba(14,165,233,0.96), rgba(59,130,246,0.96) 55%, rgba(124,58,237,0.96)) !important;
+            color: #201E1A !important;
+            box-shadow: 0 16px 38px rgba(14,165,233,0.24) !important;
+        }
+        .stButton > button[kind="primary"]:hover {
+            border-color: rgba(191,219,254,0.9) !important;
+            filter: brightness(1.05);
+        }
+        .hero-card, .soft-panel, .feature-card, .section-shell, .result-card, .calendar-panel, .unlock-shell, .status-strip, .stage-card-bridge {
+            border: 1px solid var(--line-soft);
+            border-radius: 24px;
+            background:
+                linear-gradient(180deg, var(--panel-top), var(--panel-bottom)),
+                linear-gradient(180deg, rgba(10,19,35,0.94), rgba(6,12,24,0.96));
+            box-shadow: var(--shadow-soft), inset 0 1px 0 rgba(255,255,255,0.05);
+            backdrop-filter: blur(18px);
+        }
+        .hero-card {
+            position: relative;
+            overflow: hidden;
+            padding: 34px 34px 28px 34px;
+            margin-bottom: 20px;
+            border-color: rgba(148,163,184,0.14);
+            background:
+                radial-gradient(circle at 8% 0%, rgba(250,204,21,0.10), transparent 24%),
+                radial-gradient(circle at 100% 0%, rgba(56,189,248,0.16), transparent 28%),
+                linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.015)),
+                linear-gradient(180deg, rgba(9,18,35,0.97), rgba(6,12,24,0.98));
+        }
+        .hero-card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(56,189,248,0.08), transparent 36%, rgba(168,85,247,0.12));
+            pointer-events: none;
+        }
+        .hero-card::after {
+            content: "";
+            position: absolute;
+            inset: 1px;
+            border-radius: 23px;
+            border: 1px solid rgba(255,255,255,0.05);
+            pointer-events: none;
+        }
+        .hero-eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 12px;
+            border-radius: 999px;
+            background: rgba(8,145,178,0.12);
+            border: 1px solid rgba(125,211,252,0.22);
+            color: #201E1A;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .hero-title {
+            margin: 0;
+            font-size: 2.5rem;
+            font-weight: 600;
+            letter-spacing: -0.05em;
+            line-height: 1.06;
+            color: #201E1A;
+        }
+        .hero-subtitle {
+            max-width: 900px;
+            margin: 14px 0 0 0;
+            color: #201E1A;
+            font-size: 1rem;
+            line-height: 1.72;
+        }
+        .hero-usage-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 18px;
+        }
+        .hero-usage-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(15,23,42,0.58);
+            border: 1px solid rgba(125,211,252,0.20);
+            color: #201E1A !important;
+            font-size: 0.84rem;
+            font-weight: 700;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .hero-usage-pill b {
+            color: #201E1A !important;
+        }
+        .status-strip {
+            display: flex;
+            gap: 18px;
+            align-items: center;
+            padding: 18px 20px;
+            margin: 0 0 18px 0;
+            border-color: rgba(103,232,249,0.14);
+        }
+        .status-strip .badge {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 92px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .status-strip .body { flex: 1 1 auto; }
+        .status-strip .title {
+            color: #201E1A !important;
+            font-size: 1.02rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .status-strip .desc,
+        .status-strip .meta {
+            color: #201E1A !important;
+            font-size: 0.92rem;
+            line-height: 1.58;
+        }
+        .status-strip .meta {
+            font-size: 0.83rem;
+            color: #201E1A !important;
+            margin-top: 4px;
+        }
+        .status-strip.unlocked {
+            background: linear-gradient(135deg, rgba(16,185,129,0.16), rgba(10,19,35,0.94) 52%, rgba(56,189,248,0.12));
+            border-color: rgba(52,211,153,0.24);
+        }
+        .status-strip.unlocked .badge {
+            background: rgba(16,185,129,0.14);
+            border: 1px solid rgba(110,231,183,0.24);
+            color: #201E1A !important;
+        }
+        .status-strip.limited {
+            background: linear-gradient(135deg, rgba(59,130,246,0.16), rgba(10,19,35,0.94) 48%, rgba(124,58,237,0.12));
+            border-color: rgba(96,165,250,0.24);
+        }
+        .status-strip.limited .badge {
+            background: rgba(59,130,246,0.14);
+            border: 1px solid rgba(147,197,253,0.24);
+            color: #201E1A !important;
+        }
+        .soft-panel {
+            padding: 22px 22px 18px 22px;
+            margin-bottom: 14px;
+            border-color: rgba(148,163,184,0.14);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012)),
+                linear-gradient(180deg, rgba(11,20,38,0.95), rgba(7,14,27,0.97));
+        }
+        .soft-panel h4 {
+            margin: 0 0 8px 0;
+            color: #201E1A !important;
+            font-size: 1.02rem;
+        }
+        .soft-panel p {
+            margin: 0;
+            color: var(--text-sub) !important;
+            line-height: 1.65;
+            font-size: 0.93rem;
+        }
+        .guide-list {
+            margin: 12px 0 0 0;
+            padding-left: 18px;
+        }
+        .guide-list li {
+            margin-bottom: 8px;
+            color: #201E1A !important;
+            line-height: 1.55;
+        }
+        .guide-studio-shell {
+            padding: 26px;
+            margin-bottom: 18px;
+            border-radius: 28px;
+            border: 1px solid rgba(125,211,252,0.14);
+            background:
+                radial-gradient(circle at 0% 0%, rgba(56,189,248,0.10), transparent 22%),
+                radial-gradient(circle at 100% 0%, rgba(168,85,247,0.10), transparent 26%),
+                linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012)),
+                linear-gradient(180deg, rgba(8,18,33,0.97), rgba(5,11,22,0.98));
+        }
+        .guide-studio-header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+        .guide-studio-header .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 12px;
+            border-radius: 999px;
+            background: rgba(14,165,233,0.12);
+            border: 1px solid rgba(125,211,252,0.20);
+            color: #201E1A !important;
+            font-size: 0.76rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+        .guide-studio-header h3 {
+            margin: 0;
+            color: #201E1A !important;
+            font-size: 1.32rem;
+            line-height: 1.25;
+        }
+        .guide-studio-header p {
+            margin: 10px 0 0 0;
+            max-width: 760px;
+            color: #201E1A !important;
+            line-height: 1.7;
+            font-size: 0.95rem;
+        }
+        .guide-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        .guide-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 9px 12px;
+            border-radius: 999px;
+            background: rgba(15,23,42,0.62);
+            border: 1px solid rgba(148,163,184,0.14);
+            color: #201E1A !important;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .guide-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+        }
+        .guide-card-premium {
+            position: relative;
+            overflow: hidden;
+            min-height: 220px;
+            padding: 22px 22px 18px 22px;
+            border-radius: 22px;
+            border: 1px solid rgba(148,163,184,0.14);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.012)),
+                linear-gradient(180deg, rgba(11,20,38,0.95), rgba(7,14,27,0.97));
+            box-shadow: 0 20px 46px rgba(2,8,23,0.22), inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .guide-card-premium::after {
+            content: "";
+            position: absolute;
+            inset: auto -34px -34px auto;
+            width: 110px;
+            height: 110px;
+            border-radius: 999px;
+            opacity: 0.14;
+            background: currentColor;
+            filter: blur(14px);
+        }
+        .guide-card-premium .card-label {
+            display: inline-flex;
+            margin-bottom: 10px;
+            color: #201E1A !important;
+            font-size: 0.74rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        .guide-card-premium h4 {
+            margin: 0 0 8px 0;
+            color: #201E1A !important;
+            font-size: 1.06rem;
+        }
+        .guide-card-premium p {
+            margin: 0 0 12px 0;
+            color: #201E1A !important;
+            line-height: 1.65;
+            font-size: 0.91rem;
+        }
+        .guide-step-list {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .guide-step-list li {
+            margin-bottom: 8px;
+            color: #201E1A !important;
+            line-height: 1.55;
+        }
+        .guide-step-list ul {
+            margin: 6px 0 0 0;
+            padding-left: 16px;
+            list-style: disc;
+        }
+        .guide-step-list ul li {
+            margin-bottom: 4px;
+            color: #201E1A !important;
+            font-size: 0.88rem;
+        }
+        .guide-card-premium code {
+            padding: 1px 6px;
+            border-radius: 6px;
+            background: rgba(15,23,42,0.6);
+            border: 1px solid rgba(148,163,184,0.18);
+            color: #201E1A !important;
+            font-size: 0.86em;
+            white-space: nowrap;
+            font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        }
+        .guide-readhint {
+            margin: 4px 0 0 0;
+            color: #201E1A !important;
+            line-height: 1.6;
+            font-size: 0.88rem;
+        }
+        .guide-readband {
+            margin-top: 14px;
+            padding: 18px 22px;
+            border-radius: 22px;
+            border: 1px solid rgba(148,163,184,0.14);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.012)),
+                linear-gradient(180deg, rgba(11,20,38,0.95), rgba(7,14,27,0.97));
+            box-shadow: 0 20px 46px rgba(2,8,23,0.22), inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .guide-readband-title {
+            color: #201E1A !important;
+            font-size: 1.0rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+        .guide-readband-items {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .guide-readband-item {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(15,23,42,0.5);
+            border: 1px solid rgba(148,163,184,0.12);
+        }
+        .guide-readband-item code {
+            align-self: flex-start;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(167,139,250,0.18);
+            border: 1px solid rgba(167,139,250,0.35);
+            color: #201E1A !important;
+            font-size: 0.82rem;
+            font-weight: 700;
+            white-space: nowrap;
+            font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        }
+        .guide-readband-item span {
+            color: #201E1A !important;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+        .guide-readband-tip {
+            margin-top: 12px;
+            color: #201E1A !important;
+            font-size: 0.88rem;
+        }
+        @media (max-width: 1100px) {
+            .guide-readband-items { grid-template-columns: 1fr; }
+        }
+        .guide-subhead {
+            margin: 14px 0 6px 0;
+            color: #201E1A !important;
+            font-size: 0.92rem;
+            font-weight: 600;
+        }
+        .guide-note {
+            margin-top: 12px;
+            padding: 10px 12px;
+            border-radius: 14px;
+            background: rgba(15,23,42,0.55);
+            border: 1px solid rgba(125,211,252,0.14);
+            color: #201E1A !important;
+            font-size: 0.84rem;
+            line-height: 1.55;
+        }
+        .guide-card-cyan { color: #201E1A; }
+        .guide-card-violet { color: #201E1A; }
+        .guide-card-emerald { color: #201E1A; }
+        @media (max-width: 1100px) {
+            .guide-grid { grid-template-columns: 1fr; }
+            .guide-chip-row { justify-content: flex-start; }
+        }
+        .feature-card {
+            position: relative;
+            overflow: hidden;
+            padding: 22px 22px 18px 22px;
+            margin-bottom: 12px;
+            min-height: 156px;
+            border-color: rgba(148,163,184,0.14);
+            box-shadow: 0 22px 48px rgba(2,8,23,0.28), inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .feature-card::after {
+            content: "";
+            position: absolute;
+            inset: auto -40px -40px auto;
+            width: 120px;
+            height: 120px;
+            border-radius: 999px;
+            opacity: 0.16;
+            background: currentColor;
+            filter: blur(12px);
+        }
+        .feature-card .eyebrow {
+            display: inline-flex;
+            font-size: 0.73rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            opacity: 0.96;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+        .feature-card .title {
+            color: #201E1A !important;
+            font-size: 1.08rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .feature-card .desc {
+            color:#201E1A !important;
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        .feature-green {
+            color: #201E1A;
+            background:
+                radial-gradient(circle at 0% 0%, rgba(250,204,21,0.10), transparent 24%),
+                linear-gradient(135deg, rgba(16,185,129,0.20), rgba(8,18,32,0.98));
+            border-color: rgba(52,211,153,0.24);
+        }
+        .feature-purple {
+            color: #201E1A;
+            background:
+                radial-gradient(circle at 100% 0%, rgba(56,189,248,0.10), transparent 28%),
+                linear-gradient(135deg, rgba(124,58,237,0.24), rgba(8,18,32,0.98));
+            border-color: rgba(167,139,250,0.24);
+        }
+        .metric-panel {
+            padding: 20px 20px 18px 20px;
+            border-radius: 20px;
+            border: 1px solid rgba(148,163,184,0.14);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01)),
+                linear-gradient(180deg, rgba(12,24,43,0.96), rgba(7,15,28,0.95));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 18px 42px rgba(2,8,23,0.22);
+            min-height: 128px;
+            margin-bottom: 10px;
+        }
+        .metric-panel .label {
+            color: #201E1A !important;
+            font-size: 0.76rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        .metric-panel .value {
+            color: #201E1A !important;
+            font-size: 1.78rem;
+            font-weight: 600;
+            line-height: 1.1;
+            margin-bottom: 8px;
+            letter-spacing: -0.04em;
+        }
+        .metric-panel .desc {
+            color: #201E1A !important;
+            font-size: 0.86rem;
+            line-height: 1.5;
+        }
+        .section-shell {
+            padding: 24px;
+            margin-bottom: 16px;
+            border-color: rgba(148,163,184,0.14);
+            background:
+                radial-gradient(circle at 100% 0%, rgba(250,204,21,0.08), transparent 22%),
+                linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.01)),
+                linear-gradient(180deg, rgba(10,20,37,0.96), rgba(7,14,27,0.98));
+        }
+        .section-shell h3 {
+            margin: 0 0 10px 0;
+            color: #201E1A !important;
+            font-size: 1.14rem;
+        }
+        .section-shell p {
+            margin: 0;
+            color: #201E1A !important;
+            line-height: 1.72;
+        }
+        .result-card {
+            padding: 22px;
+            margin-bottom: 12px;
+            border-color: rgba(125,211,252,0.18);
+            background:
+                radial-gradient(circle at 100% 0%, rgba(250,204,21,0.08), transparent 24%),
+                linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.008)),
+                linear-gradient(180deg, rgba(10,21,39,0.98), rgba(8,16,29,0.96));
+        }
+        .result-card h4 {
+            margin: 0 0 10px 0;
+            color: #201E1A !important;
+            font-size: 1.05rem;
+        }
+        .result-card p {
+            margin: 0 0 7px 0;
+            color: #201E1A !important;
+            line-height: 1.6;
+        }
+        .number-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 12px 0 14px 0;
+        }
+        .number-ball {
+            width: 44px;
+            height: 44px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            color: #201E1A;
+            background: #F4F1EA;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.65), 0 10px 22px rgba(251,191,36,0.18);
+        }
+        .divider-space { height: 12px; }
+        .unlock-shell {
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            border-color: rgba(167,139,250,0.22);
+            background: linear-gradient(135deg, rgba(124,58,237,0.16), rgba(8,16,30,0.95));
+        }
+        .unlock-shell .title {
+            color: #201E1A !important;
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .unlock-shell .desc {
+            color: #201E1A !important;
+            font-size: 0.92rem;
+            line-height: 1.6;
+        }
+        .calendar-panel {
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            border-color: rgba(96,165,250,0.18);
+        }
+        .calendar-panel .title {
+            color: #201E1A !important;
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        .calendar-panel .desc {
+            color: #201E1A !important;
+            font-size: 0.9rem;
+        }
+        .calendar-head {
+            text-align: center;
+            padding: 8px 0 10px 0;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #201E1A !important;
+        }
+        .calendar-cell {
+            min-height: 72px;
+            border-radius: 16px;
+            border: 1px dashed rgba(148,163,184,0.12);
+            background: rgba(255,255,255,0.02);
+        }
+        .calendar-cell.empty {
+            background: transparent;
+            border-color: transparent;
+        }
+        .stage-card-bridge {
+            padding: 18px 20px;
+            margin: 10px 0 18px 0;
+            border-color: rgba(103,232,249,0.2);
+            background: linear-gradient(135deg, rgba(14,165,233,0.14), rgba(8,16,30,0.96) 55%, rgba(91,33,182,0.16));
+        }
+        .stage-card-bridge .header-title {
+            color: #201E1A !important;
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        .stage-card-bridge .title {
+            color: #201E1A !important;
+            font-size: 1.08rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        .stage-card-bridge .desc {
+            color: #201E1A !important;
+            font-size: 0.92rem;
+            line-height: 1.6;
+        }
+        .stage-card-bridge .meta {
+            color: #201E1A !important;
+            font-size: 0.83rem;
+            margin-top: 8px;
+        }
+        [data-testid="stDataFrame"] {
+            border-radius: 18px;
+            overflow: hidden;
+            border: 1px solid rgba(148,163,184,0.12);
+            box-shadow: 0 16px 32px rgba(2,8,23,0.16);
+        }
+        @media (max-width: 900px) {
+            .block-container {
+                padding-top: 1rem;
+                padding-bottom: 1.8rem;
+                padding-left: 0.9rem;
+                padding-right: 0.9rem;
+            }
+            .hero-card, .soft-panel, .feature-card, .section-shell, .result-card, .calendar-panel, .unlock-shell, .status-strip, .stage-card-bridge {
+                border-radius: 18px;
+            }
+            .hero-card { padding: 22px 18px 18px 18px; }
+            .hero-title { font-size: 1.9rem; }
+            .hero-subtitle, .soft-panel p, .feature-card .desc, .section-shell p, .result-card p, .status-strip .desc, .status-strip .meta { font-size: 0.9rem; }
+            .status-strip {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .metric-panel {
+                min-height: auto;
+                padding: 16px;
+            }
+            .metric-panel .value { font-size: 1.48rem; }
+            .number-ball {
+                width: 40px;
+                height: 40px;
+                font-size: 0.92rem;
+            }
+            div[data-baseweb="tab-list"] {
+                gap: 8px;
+                padding-bottom: 4px;
+            }
+            button[role="tab"] {
+                padding: 9px 12px !important;
+                font-size: 0.86rem !important;
+            }
+            div[data-testid="stHorizontalBlock"]:not(:has(> div:nth-child(6))) {
+                flex-wrap: wrap;
+                gap: 0.75rem;
+            }
+            div[data-testid="stHorizontalBlock"]:not(:has(> div:nth-child(6))) > div[data-testid="column"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+                min-width: 100% !important;
+            }
+            div[data-testid="stHorizontalBlock"]:has(> div:nth-child(6)) {
+                gap: 0.3rem;
+            }
+            .stButton > button,
+            .stDownloadButton > button,
+            .stFormSubmitButton > button {
+                width: 100%;
+            }
+            [data-testid="stDataFrame"] {
+                overflow-x: auto;
+            }
+        }
+        @media (max-width: 640px) {
+            .hero-title { font-size: 1.65rem; }
+            .hero-usage-pill {
+                width: 100%;
+                justify-content: flex-start;
+            }
+            .sim-shell, .sim-console, .sim-banner {
+                padding-left: 16px;
+                padding-right: 16px;
+                border-radius: 18px;
+            }
+            .number-ball {
+                width: 36px;
+                height: 36px;
+                font-size: 0.86rem;
+            }
+        }
+        
+.sim-shell {
+    border: 1px solid rgba(125,211,252,0.16);
+    border-radius: 24px;
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.01)),
+        linear-gradient(180deg, rgba(7,16,30,0.98), rgba(4,10,21,0.98));
+    box-shadow: 0 24px 70px rgba(2, 8, 23, 0.34), inset 0 1px 0 rgba(255,255,255,0.05);
+    padding: 22px 24px;
+    margin: 8px 0 18px 0;
+}
+.sim-shell h4, .sim-card h4, .sim-banner h4 { margin: 0 0 8px 0; color: #201E1A; }
+.sim-shell p, .sim-card p, .sim-banner p { color: #201E1A; line-height: 1.65; }
+.sim-card {
+    border: 1px solid rgba(148,163,184,0.16);
+    border-radius: 22px;
+    padding: 20px 22px;
+    min-height: 196px;
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)),
+        linear-gradient(180deg, rgba(11,21,38,0.98), rgba(6,12,24,0.98));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+}
+.sim-card + .sim-card { margin-top: 12px; }
+.sim-badge-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0 0 0; }
+.sim-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 13px;
+    border-radius: 999px;
+    background: rgba(15,23,42,0.72);
+    border: 1px solid rgba(125,211,252,0.16);
+    color: #201E1A;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+.sim-value {
+    display: block;
+    margin-top: 12px;
+    color: #201E1A;
+    font-size: 2rem;
+    font-weight: 600;
+    letter-spacing: -0.04em;
+}
+.sim-meta-list {
+    margin: 16px 0 0 0;
+    padding-left: 18px;
+    color: #201E1A;
+    line-height: 1.8;
+}
+.sim-banner {
+    border: 1px solid rgba(34,211,238,0.16);
+    border-radius: 24px;
+    padding: 18px 22px;
+    margin: 6px 0 16px 0;
+    background:
+        radial-gradient(circle at 0% 0%, rgba(34,211,238,0.16), transparent 24%),
+        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.14), transparent 28%),
+        linear-gradient(180deg, rgba(9,18,35,0.98), rgba(6,12,24,0.98));
+}
+.sim-banner .eyebrow, .sim-card .eyebrow {
+    display: inline-flex;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #201E1A;
+    background: rgba(8,145,178,0.12);
+    border: 1px solid rgba(125,211,252,0.18);
+    margin-bottom: 10px;
+}
+.sim-mini-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+}
+.sim-mini-item {
+    border-radius: 18px;
+    padding: 16px 16px;
+    background: rgba(15,23,42,0.66);
+    border: 1px solid rgba(148,163,184,0.14);
+}
+.sim-mini-label { color: #6A655C; font-size: 0.82rem; font-weight: 700; }
+.sim-mini-value { color: #201E1A; font-size: 1.24rem; font-weight: 600; margin-top: 6px; }
+.sim-console {
+    border-radius: 26px;
+    padding: 22px 24px;
+    border: 1px solid rgba(251,191,36,0.18);
+    background:
+        radial-gradient(circle at 0% 0%, rgba(245,158,11,0.16), transparent 24%),
+        radial-gradient(circle at 100% 0%, rgba(239,68,68,0.10), transparent 24%),
+        linear-gradient(180deg, rgba(14,18,30,0.99), rgba(8,10,18,0.99));
+    box-shadow: 0 24px 70px rgba(2, 8, 23, 0.34), inset 0 1px 0 rgba(255,255,255,0.05);
+    margin: 10px 0 18px 0;
+}
+.sim-console-top {
+    display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px; align-items: flex-start;
+    margin-bottom: 16px;
+}
+.sim-console-kpis { display: flex; flex-wrap: wrap; gap: 10px; }
+.sim-console-kpi {
+    min-width: 150px;
+    padding: 12px 14px;
+    border-radius: 18px;
+    background: rgba(15,23,42,0.7);
+    border: 1px solid rgba(148,163,184,0.16);
+}
+.sim-console-kpi b { display:block; color:#201E1A; font-size:1.12rem; margin-top:6px; }
+.sim-console-kpi span { color:#6A655C; font-size:0.8rem; font-weight:700; }
+.sim-form-caption {
+    color: #6A655C;
+    font-size: 0.86rem;
+    margin: 8px 0 0 0;
+    line-height: 1.7;
+}
+@media (max-width: 980px) {
+    .sim-mini-grid { grid-template-columns: 1fr; }
+    .sim-console-top { flex-direction: column; }
+}
+
+/* [v69] 날짜 선택 달력(baseweb datepicker) 팝업 다크 통일 */
+div[data-baseweb="popover"] div[data-baseweb="calendar"],
+div[data-baseweb="calendar"] {
+    background: #0b1327 !important;
+    color: #201E1A !important;
+}
+div[data-baseweb="calendar"] * { color: #201E1A !important; }
+div[data-baseweb="calendar"] button:hover {
+    background: rgba(56,189,248,0.18) !important;
+}
+div[data-baseweb="calendar"] [aria-selected="true"] {
+    background: linear-gradient(135deg, #4EC8D4 0%, #34A7B6 100%) !important;
+    color: #0E3A42 !important;
+}
+
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+    # ── EDITORIAL PAPER (1b-B) · 라이트 고급 리서치 테마 ───────────────────────
+    #   원본 다크 스타일 위에 덮어 라이트 페이퍼 톤으로 전환.
+    st.markdown(
+        """
+        <style>
+        @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
+
+        :root {
+            --ed-bg:#F7F5F0; --ed-panel:#FFFEFB; --ed-panel2:#F2EFE8;
+            --ed-line:rgba(28,25,20,.10); --ed-line2:rgba(28,25,20,.06);
+            --ed-ink:#201E1A; --ed-ink2:#6A655C; --ed-ink3:#9A9489;
+            --ed-ac:#2D4A6B; --ed-ac2:#3A5A80; --ed-acSoft:rgba(45,74,107,.08); --ed-acLine:rgba(45,74,107,.24);
+        }
+
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+            background:#F7F5F0 !important; color:var(--ed-ink) !important;
+            font-family:'Pretendard',-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif !important;
+        }
+        .block-container { max-width:1180px; }
+
+        /* 타이포 — 전부 Pretendard 단일 폰트로 통일 */
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"],
+        h1, h2, h3, h4, h5, h6, p, li, span, label, div, td, th,
+        button, input, textarea, select, .ball, .number-ball, .sball {
+            font-family:'Pretendard','Pretendard Variable',-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif !important;
+        }
+        /* Material 아이콘 폰트 복원 (아이콘 글리프가 글자로 깨지는 문제 방지) */
+        [data-testid="stIconMaterial"], [data-testid="stExpanderToggleIcon"],
+        .material-icons, .material-icons-outlined, .material-symbols-outlined, .material-symbols-rounded,
+        span[class*="material-symbols"], span[class*="material-icons"], i[class*="material"] {
+            font-family:'Material Symbols Rounded','Material Symbols Outlined','Material Icons','Material Icons Outlined' !important;
+        }
+        h1, h2, h3, h4, .hero-title, .header-title {
+            font-weight:600 !important; letter-spacing:-.2px !important; color:var(--ed-ink) !important;
+        }
+        .number-ball, .ball, .sball, .smeta .sc, [data-testid="stMetricValue"], .card-value {
+            font-feature-settings:'tnum' 1 !important;
+        }
+
+        /* 카드/패널 → 라이트 페이퍼 */
+        .hero-card, .soft-panel, .feature-card, .section-shell, .result-card,
+        .calendar-panel, .unlock-shell, .status-strip, .stage-card-bridge,
+        .metric-panel, .guide-card-premium, .sim-card, .sim-banner, .sim-console,
+        .guide-studio-shell, [data-testid="stExpander"] {
+            background:var(--ed-panel) !important;
+            border:1px solid var(--ed-line) !important;
+            border-radius:16px !important;
+            box-shadow:0 1px 2px rgba(28,25,20,.04) !important;
+            backdrop-filter:none !important;
+        }
+        .hero-card { position:relative; border-color:var(--ed-line) !important; }
+        .hero-card::before { content:none !important; }
+        .hero-card::after {
+            content:'' !important; position:absolute !important; left:0; right:0; top:0; height:3px;
+            background:var(--ed-ac) !important; border:0 !important; border-radius:0 !important;
+        }
+
+        /* eyebrow/배지 → 틸 스몰캡 */
+        .hero-eyebrow, .eyebrow, .card-label, .hero-usage-pill, .sim-badge {
+            background:var(--ed-acSoft) !important; border:1px solid var(--ed-acLine) !important;
+            color:var(--ed-ac) !important; font-family:'Pretendard',sans-serif !important;
+            letter-spacing:1.5px !important; text-transform:uppercase !important;
+        }
+
+        /* 공 → 라이트 */
+        .number-ball {
+            background:var(--ed-panel2) !important;
+            border:1px solid var(--ed-line) !important; box-shadow:none !important;
+        }
+
+        /* 탭 → 틸 언더라인 */
+        div[data-baseweb="tab-list"] { border-bottom:1px solid var(--ed-line); gap:26px; }
+        button[role="tab"] {
+            border-radius:0 !important; background:transparent !important; border:0 !important;
+            border-bottom:2px solid transparent !important; color:var(--ed-ink3) !important;
+            box-shadow:none !important; padding:12px 2px !important;
+        }
+        button[role="tab"][aria-selected="true"] {
+            background:transparent !important; border-bottom:2px solid var(--ed-ac) !important;
+            color:var(--ed-ink) !important;
+        }
+
+        /* 버튼 → 차분한 라이트 (primary=틸) */
+        .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+            background:#ECE8E1 !important; border:1px solid rgba(28,25,20,.10) !important;
+            color:#201E1A !important; border-radius:10px !important;
+            box-shadow:none !important; font-weight:600 !important;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
+            background:#E2DDD4 !important; border-color:rgba(28,25,20,.18) !important;
+            color:#201E1A !important; transform:none !important;
+        }
+        .stButton > button[kind="primary"],
+        .stButton > button[kind="primary"] *,
+        .stButton > button[kind="primary"] p,
+        .stButton > button[kind="primary"] div,
+        .stButton > button[kind="primary"] span {
+            color:#201E1A !important;
+        }
+        .stButton > button[kind="primary"] {
+            background:#ECE8E1 !important; border:1px solid rgba(28,25,20,.10) !important; box-shadow:none !important;
+        }
+        .stButton > button[kind="primary"]:hover {
+            background:#E2DDD4 !important; border-color:rgba(28,25,20,.18) !important; color:#201E1A !important;
+        }
+
+        /* 카드 배너 '멍자국'(블러 원/글로우) 제거 + 통일 */
+        .guide-card-premium::after, .guide-card-premium::before,
+        .feature-card::after, .feature-card::before,
+        .soft-panel::after, .soft-panel::before,
+        .result-card::after, .result-card::before,
+        .section-shell::after, .section-shell::before,
+        .stage-card-bridge::after, .stage-card-bridge::before,
+        .unlock-shell::after, .unlock-shell::before { content:none !important; }
+        /* 카드 안 eyebrow 배지 통일(틸 소프트) */
+        .feature-card .eyebrow, .sim-card .eyebrow, .sim-banner .eyebrow {
+            background:var(--ed-acSoft) !important; border:1px solid var(--ed-acLine) !important;
+            color:var(--ed-ac) !important; padding:3px 9px !important; border-radius:6px !important;
+            opacity:1 !important; font-weight:600 !important;
+        }
+
+        /* 입력/표/지표/진행바 */
+        [data-baseweb="select"] > div, .stTextInput input, .stNumberInput input, .stDateInput input, textarea {
+            background:#fff !important; border:1px solid var(--ed-line) !important; color:var(--ed-ink) !important;
+        }
+        [data-testid="stExpander"] summary { color:var(--ed-ink2) !important; }
+        [data-testid="stMetricValue"] { color:var(--ed-ink) !important; font-weight:600 !important; font-size:1.3rem !important; line-height:1.3 !important; }
+        [data-testid="stMetricLabel"] { color:var(--ed-ink3) !important; }
+        [data-testid="stProgress"] div[role="progressbar"] > div { background:var(--ed-ac) !important; }
+        [data-testid="stDataFrame"], .stDataFrame { background:#fff !important; border:1px solid var(--ed-line) !important; border-radius:12px; }
+        [data-testid="stHeader"] { background:transparent !important; }
+
+        /* 링크/구분선/캡션 */
+        a { color:var(--ed-ac2) !important; }
+        hr { border-color:var(--ed-line2) !important; background:var(--ed-line2) !important; }
+        [data-testid="stCaptionContainer"], small { color:var(--ed-ink3) !important; }
+
+        /* 가이드/리드밴드 다크 잔여 → 라이트 (Image1) */
+        .guide-readband, .guide-studio-shell, .guide-chip-row, .guide-list,
+        .guide-grid > div, .guide-readband-items {
+            background:var(--ed-panel) !important; border-color:var(--ed-line) !important;
+        }
+        .guide-readband-item, .guide-chip, .hero-usage-pill {
+            background:var(--ed-panel2) !important; border:1px solid var(--ed-line) !important;
+            color:var(--ed-ink) !important;
+        }
+        .guide-readband-item code { background:var(--ed-acSoft) !important; color:var(--ed-ac) !important; }
+        .guide-readband-title { color:var(--ed-ink) !important; }
+        .guide-readband-tip, .guide-readband-item span, .guide-note { color:var(--ed-ink2) !important; }
+
+        /* 인라인 코드 배지 → 틸 소프트 (Image1 회색 배지 교체) */
+        .stMarkdown code, .guide-grid code, li code, p code {
+            background:rgba(45,74,107,.08) !important; color:#2D4A6B !important;
+            border:1px solid rgba(45,74,107,.20) !important; border-radius:6px !important;
+            padding:1px 7px !important; font-family:'Pretendard',sans-serif !important; font-size:.9em !important;
+        }
+        .guide-note {
+            background:rgba(45,74,107,.06) !important; border:1px solid rgba(45,74,107,.20) !important;
+            color:#3A5A80 !important;
+        }
+
+        /* 날짜 선택 캘린더 라이트 + 오늘/선택 틸 (Image2) */
+        [data-baseweb="popover"] div[role="dialog"], [data-baseweb="calendar"] { background:#FFFEFB !important; }
+        [data-baseweb="calendar"] [role="gridcell"] > div { color:#201E1A !important; }
+        /* 선택된 날짜 = 틸 그라데이션 (사용자 지정 스샷) */
+        [data-baseweb="calendar"] div[aria-selected="true"],
+        [data-baseweb="calendar"] div[aria-selected="true"] * {
+            background:linear-gradient(135deg, #4EC8D4 0%, #34A7B6 100%) !important;
+            color:#0E3A42 !important; font-weight:700 !important;
+            border:none !important; border-radius:10px !important;
+        }
+        /* 오늘(미선택 시) = 같은 틸 톤 외곽선 */
+        [data-baseweb="calendar"] div[aria-current="date"]:not([aria-selected="true"]),
+        [data-baseweb="calendar"] div[aria-current="date"]:not([aria-selected="true"]) *,
+        [data-baseweb="calendar"] [aria-label*="오늘"] > div:not([aria-selected="true"]),
+        [data-baseweb="calendar"] [aria-label*="Today"] > div:not([aria-selected="true"]) {
+            background:rgba(78,200,212,.14) !important; color:#176B76 !important;
+            border:1px solid rgba(52,167,182,.6) !important; border-radius:10px !important; font-weight:600 !important;
+        }
+        [data-baseweb="calendar"] div[role="gridcell"] > div:hover {
+            background:rgba(78,200,212,.16) !important; border-radius:10px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    # Manage app 버튼 숨김 스크립트 제거 (Streamlit 1.58+ 호환성 문제로 제거)
+
+
+class LottoPredictor:
+    def __init__(self, excel_path):
+        self.excel_path = excel_path
+        self.rows = self._load_rows(excel_path)
+        self.total_draws = len(self.rows)
+        self.universe = list(range(1, 46))
+        self.base_hit_probability = 6.0 / 45.0
+        self.max_gap_bucket = 25
+        self.latest_row = list(self.rows[0]) if self.rows else []
+        self.latest_row_set = set(self.latest_row)
+
+        self.total_counter = Counter(n for row in self.rows for n in row)
+        self.position_counters = [Counter() for _ in range(6)]
+        self.chrono_rows = list(reversed(self.rows))
+        for row in self.rows:
+            sorted_row = sorted(int(num) for num in row)
+            for idx, num in enumerate(sorted_row):
+                if idx < 6:
+                    self.position_counters[idx][num] += 1
+
+        self.last_seen_gap = self._build_last_seen_gap()
+        self.gap_probability = self._build_gap_probability(prior_strength=32.0)
+        self.pair_counter = self._build_pair_counter(window=320)
+        self.avg_total_freq = (len(self.rows) * 6) / 45.0
+        self.avg_pair_freq = max((len(self.rows) * 15) / ((45 * 44) / 2), 1e-6)
+        self.gap_factor_lookup = self._build_gap_factor_lookup()
+        self.pair_strength_matrix = self._build_pair_strength_matrix()
+        self.markov_transition_matrix = self._build_markov_transition_matrix()
+        self.latest_row_transition_lookup = self._build_latest_row_transition_lookup()
+        self.markov_transition_weight_lookup = self._build_markov_transition_weight_lookup()
+        self.number_state_transition_stats = self._build_number_state_transition_stats(window=8)
+        self.projected_probability_lookup = self._build_projected_probability_lookup()
+        self.giannella_pattern_stats = self._build_giannella_pattern_stats()
+        self.giannella_segment_profiles = self._build_giannella_segment_profiles()
+        self.group_portfolio_stats = self._build_group_portfolio_stats()
+        self.probability_group_profiles = self._build_probability_group_profiles()
+        self.probability_weight_lookup = self._build_probability_weight_lookup()
+        self.base_position_weights = self._build_base_position_weights()
+        self.pattern_signature_stats = self._build_pattern_signature_stats()
+        self._projected_log_lookup = self._build_log_lookup(self.projected_probability_lookup, normalize_by_base=True)
+        self._transition_log_lookup = self._build_log_lookup(self.markov_transition_weight_lookup)
+        self._state_log_lookup = self._build_log_lookup(self.probability_weight_lookup)
+        self._anchor_log_lookup = self._build_log_lookup(self.latest_row_transition_lookup, normalize_by_base=True)
+        self._pair_log_matrix = self._build_pair_log_matrix()
+        self.adjacent_overlap_stats = self._build_adjacent_overlap_stats()
+        self._probability_portfolio_score_cache = {}
+        self._probability_mcmc_score_cache = {}
+        self._ticket_feature_cache = {}
+        self.dynamic_score_config = self._build_rolling_backtest_score_config()
+
+    def _build_advanced_pattern_stats(self):
+        # 1. 최근 트렌드 가중치 (10, 30, 100회차)
+        recent_10 = Counter(n for row in self.rows[:10] for n in row)
+        recent_30 = Counter(n for row in self.rows[:30] for n in row)
+        recent_100 = Counter(n for row in self.rows[:100] for n in row)
+        
+        # 2. 번호별 핫/콜드 지수
+        hot_cold_map = {}
+        for n in self.universe:
+            freq = self.total_counter[n]
+            avg_freq = (len(self.rows) * 6) / 45
+            rel_freq = freq / avg_freq if avg_freq > 0 else 1.0
+            gap = self.last_seen_gap.get(n, 0)
+            
+            # 핫 지수: 최근 출현 빈도 가중합
+            hot_score = (recent_10[n] * 4.5 + recent_30[n] * 2.0 + recent_100[n] * 0.8) / 7.3
+            # 콜드 지수: 미출현 기간 가중치 (15회 이상부터 가속)
+            cold_score = max(0, gap - 12) / 8.0
+            
+            hot_cold_map[n] = {
+                "hot": hot_score,
+                "cold": cold_score,
+                "rel_freq": rel_freq
+            }
+        return hot_cold_map
+
+    def _advanced_pattern_score(self, numbers):
+        # 조합의 통계적 적합성을 평가하는 정밀 공식
+        # 1. 합계 분포 점수 (로또 평균 138, 표준편차 30의 정규분포 가정)
+        s = sum(numbers)
+        sum_score = math.exp(-((s - 138)**2) / (2 * 30**2))
+        
+        # 2. 홀짝 비율 점수 (3:3 최적, 2:4/4:2 차선)
+        odds = sum(1 for n in numbers if n % 2 != 0)
+        odd_ratio_score = {3: 1.0, 2: 0.85, 4: 0.85, 1: 0.4, 5: 0.4, 0: 0.1, 6: 0.1}.get(odds, 0.05)
+        
+        # 3. 저고 비율 점수 (1~22: 저, 23~45: 고)
+        lows = sum(1 for n in numbers if n <= 22)
+        low_ratio_score = {3: 1.0, 2: 0.85, 4: 0.85, 1: 0.4, 5: 0.4, 0: 0.1, 6: 0.1}.get(lows, 0.05)
+        
+        # 4. 연번(Consecutive) 제어
+        sorted_nums = sorted(numbers)
+        consecutive_count = sum(1 for i in range(len(sorted_nums)-1) if sorted_nums[i+1] - sorted_nums[i] == 1)
+        consecutive_score = 1.0 if consecutive_count <= 1 else (0.4 if consecutive_count == 2 else 0.05)
+        
+        # 5. 끝수(Tail digit) 다양성
+        tails = [n % 10 for n in numbers]
+        max_tail = max(Counter(tails).values())
+        tail_score = 1.0 if max_tail <= 2 else 0.25
+        
+        # 6. 이월수(Overlap with latest) 점수
+        overlap = len(set(numbers) & self.latest_row_set)
+        overlap_score = {1: 1.0, 0: 0.8, 2: 0.7, 3: 0.2, 4: 0.05}.get(overlap, 0.01)
+
+        # 7. 구간 분포 (9단위 5개 구간)
+        zones = [0] * 5
+        for n in numbers:
+            idx = min((n-1)//9, 4)
+            zones[idx] += 1
+        zone_score = 1.0 if max(zones) <= 3 else 0.3
+
+        return (sum_score * 0.20 + odd_ratio_score * 0.15 + low_ratio_score * 0.15 + 
+                consecutive_score * 0.15 + tail_score * 0.1 + overlap_score * 0.15 + zone_score * 0.1)
+
+
+    def _load_rows(self, excel_path):
+        df = pd.read_excel(excel_path)
+        expected_number_cols = [f"번호{i}" for i in range(1, 7)]
+        if all(col in df.columns for col in expected_number_cols):
+            number_cols = expected_number_cols
+        else:
+            number_cols = [col for col in df.columns if str(col).startswith("번호")]
+            if len(number_cols) >= 6:
+                number_cols = sorted(
+                    number_cols,
+                    key=lambda col: int("".join(ch for ch in str(col) if ch.isdigit()) or 999),
+                )[:6]
+            else:
+                number_cols = list(df.columns[:6])
+        rows = []
+        for _, row in df[number_cols].iterrows():
+            vals = [int(cell) for cell in row.tolist() if isinstance(cell, (int, float)) and 1 <= int(cell) <= 45]
+            if len(vals) == 6:
+                rows.append(vals)
+        return rows
+
+    def _build_last_seen_gap(self):
+        last_seen = {n: self.total_draws for n in self.universe}
+        for idx, row in enumerate(self.rows):
+            for n in row:
+                if last_seen[n] == self.total_draws:
+                    last_seen[n] = idx
+        return last_seen
+
+    def _build_gap_probability(self, prior_strength=32.0):
+        stats = {gap: {"success": 0, "total": 0} for gap in range(self.max_gap_bucket + 1)}
+        chrono_rows = list(reversed(self.rows))
+        last_seen_idx = {n: None for n in self.universe}
+        for idx, row in enumerate(chrono_rows):
+            present = set(row)
+            for n in self.universe:
+                if last_seen_idx[n] is not None:
+                    gap = min(idx - last_seen_idx[n] - 1, self.max_gap_bucket)
+                    if gap >= 0:
+                        stats[gap]["total"] += 1
+                        if n in present:
+                            stats[gap]["success"] += 1
+            for n in present:
+                last_seen_idx[n] = idx
+        return {
+            g: (s["success"] + self.base_hit_probability * prior_strength) / (s["total"] + prior_strength)
+            for g, s in stats.items()
+        }
+
+    def _build_pair_counter(self, window=320):
+        pair_counter = Counter()
+        for row in self.rows[:window]:
+            nums = sorted(list(row))
+            for i in range(len(nums)):
+                for j in range(i + 1, len(nums)):
+                    pair_counter[(nums[i], nums[j])] += 1
+        return pair_counter
+
+    def _build_adjacent_overlap_stats(self):
+        overlaps = [len(set(self.rows[i]) & set(self.rows[i + 1])) for i in range(len(self.rows) - 1)]
+        return {"distribution": Counter(overlaps), "average": sum(overlaps) / len(overlaps) if overlaps else 0}
+
+    def _build_gap_factor_lookup(self):
+        lookup = [1.0] * 46
+        for number in self.universe:
+            gap = self.last_seen_gap[number]
+            prob = self.gap_probability.get(min(gap, self.max_gap_bucket), self.base_hit_probability)
+            lookup[number] = min(max(prob / self.base_hit_probability, 0.78), 1.35)
+        return lookup
+
+    def _build_pair_strength_matrix(self):
+        matrix = [[1.0] * 46 for _ in range(46)]
+        normalizer = self.avg_pair_freq + 1.0
+        for idx, left in enumerate(self.universe):
+            for right in self.universe[idx + 1 :]:
+                pair_count = float(self.pair_counter.get((left, right), 0))
+                raw_ratio = (pair_count + 2.0) / normalizer
+                normalized_ratio = raw_ratio ** 0.38
+                clipped_ratio = min(max(normalized_ratio, 0.91), 1.13)
+                matrix[left][right] = clipped_ratio
+                matrix[right][left] = clipped_ratio
+        return matrix
+
+    def _build_markov_transition_matrix(self):
+        overall_prior = {
+            number: (self.total_counter[number] + 1.0) / (self.total_draws * 6 + 45.0)
+            for number in self.universe
+        }
+        matrix = [[0.0] * 46 for _ in range(46)]
+        recent_horizon = max(min(len(self.chrono_rows) - 1, 72), 1)
+        for prev_number in self.universe:
+            prev_zone = self._giannella_zone_index(prev_number)
+            for next_number in self.universe:
+                same_zone_bonus = 1.08 if self._giannella_zone_index(next_number) == prev_zone else 1.0
+                matrix[prev_number][next_number] = (0.24 + overall_prior[next_number] * 24.0) * same_zone_bonus
+
+        if len(self.chrono_rows) >= 2:
+            for step, (prev_row, next_row) in enumerate(zip(self.chrono_rows[:-1], self.chrono_rows[1:])):
+                recency_ratio = max((recent_horizon - min(step, recent_horizon)) / recent_horizon, 0.0)
+                transition_weight = 1.0 + (recency_ratio * 1.8)
+                for prev_number in prev_row:
+                    prev_zone = self._giannella_zone_index(prev_number)
+                    for next_number in next_row:
+                        same_zone_bonus = 1.14 if self._giannella_zone_index(next_number) == prev_zone else 1.0
+                        band_bonus = 1.05 if abs(prev_number - next_number) <= 9 else 1.0
+                        matrix[prev_number][next_number] += transition_weight * same_zone_bonus * band_bonus
+
+        for prev_number in self.universe:
+            row_total = sum(matrix[prev_number][next_number] for next_number in self.universe)
+            if row_total <= 0:
+                uniform = 1.0 / len(self.universe)
+                for next_number in self.universe:
+                    matrix[prev_number][next_number] = uniform
+            else:
+                for next_number in self.universe:
+                    matrix[prev_number][next_number] /= row_total
+        return matrix
+
+    def _build_latest_row_transition_lookup(self):
+        lookup = [self.base_hit_probability] * 46
+        if not self.rows:
+            return lookup
+
+        latest_row = self.rows[0]
+        if not latest_row:
+            return lookup
+
+        denominator = len(latest_row)
+        for number in self.universe:
+            lookup[number] = sum(self.markov_transition_matrix[source][number] for source in latest_row) / denominator
+        return lookup
+
+    def _build_markov_transition_weight_lookup(self):
+        lookup = [0.0] * 46
+        if not self.rows:
+            for number in self.universe:
+                lookup[number] = 1.0
+            return lookup
+
+        recent_rows = self.rows[: min(5, len(self.rows))]
+        recent_denominator = sum(1.0 / (idx + 1) for idx in range(len(recent_rows))) or 1.0
+        for number in self.universe:
+            latest_transition = self.latest_row_transition_lookup[number]
+            recent_transition = 0.0
+            for idx, row in enumerate(recent_rows):
+                weight = 1.0 / (idx + 1)
+                row_transition = sum(self.markov_transition_matrix[source][number] for source in row) / len(row)
+                recent_transition += row_transition * weight
+            recent_transition /= recent_denominator
+            overall_probability = (self.total_counter[number] + 1.0) / (self.total_draws * 6 + 45.0)
+            gap_probability = self.gap_probability.get(min(self.last_seen_gap[number], self.max_gap_bucket), self.base_hit_probability)
+            score = (
+                (latest_transition * 0.48)
+                + (recent_transition * 0.26)
+                + (gap_probability * 0.12)
+                + (overall_probability * 0.14)
+            )
+            lookup[number] = max(score / self.base_hit_probability, 1e-9)
+
+        # 정규화: 평균 가중치가 1.0이 되도록 조정 (상대적 비교 기준 유지)
+        mean_weight = sum(lookup[number] for number in self.universe) / len(self.universe)
+        if mean_weight > 0:
+            for number in self.universe:
+                lookup[number] /= mean_weight
+        return lookup
+
+    def _state_gap_bucket(self, gap):
+        if gap <= 1:
+            return 0
+        if gap <= 3:
+            return 1
+        if gap <= 6:
+            return 2
+        if gap <= 10:
+            return 3
+        return 4
+
+    def _build_number_state_transition_stats(self, window=8, prior_strength=18.0):
+        stats = {number: {} for number in self.universe}
+        chrono_rows = list(reversed(self.rows))
+        if len(chrono_rows) <= window:
+            return {"window": window, "prior_strength": prior_strength, "stats": stats}
+
+        for idx in range(window, len(chrono_rows)):
+            recent_rows = chrono_rows[idx - window : idx]
+            next_row = set(chrono_rows[idx])
+            recent_rows_latest_first = list(reversed(recent_rows))
+            for number in self.universe:
+                hit_count = sum(1 for row in recent_rows if number in row)
+                gap = window + 1
+                for offset, row in enumerate(recent_rows_latest_first):
+                    if number in row:
+                        gap = offset
+                        break
+                state = (hit_count, self._state_gap_bucket(gap))
+                state_bucket = stats[number].setdefault(state, {"success": 0.0, "total": 0.0})
+                state_bucket["total"] += 1.0
+                if number in next_row:
+                    state_bucket["success"] += 1.0
+
+        return {"window": window, "prior_strength": prior_strength, "stats": stats}
+
+    def _current_number_state(self, number, recent_rows, window):
+        hit_count = sum(1 for row in recent_rows if number in row)
+        gap = window + 1
+        for offset, row in enumerate(recent_rows):
+            if number in row:
+                gap = offset
+                break
+        return hit_count, self._state_gap_bucket(gap)
+
+    def _build_projected_probability_lookup(self):
+        lookup = [0.0] * 46
+        if not self.rows:
+            for number in self.universe:
+                lookup[number] = self.base_hit_probability
+            return lookup
+
+        state_window = int(self.number_state_transition_stats.get("window", 8))
+        prior_strength = float(self.number_state_transition_stats.get("prior_strength", 18.0))
+        state_stats = self.number_state_transition_stats.get("stats", {})
+        recent_rows = self.rows[:state_window]
+        raw_scores = {}
+
+        for number in self.universe:
+            transition_probability = self.latest_row_transition_lookup[number]
+            overall_probability = (self.total_counter[number] + 1.0) / (self.total_draws * 6 + 45.0)
+            gap_probability = self.gap_probability.get(min(self.last_seen_gap[number], self.max_gap_bucket), self.base_hit_probability)
+            current_state = self._current_number_state(number, recent_rows, state_window)
+            state_bucket = state_stats.get(number, {}).get(current_state)
+            if state_bucket is None:
+                state_probability = (overall_probability * 0.45) + (gap_probability * 0.55)
+            else:
+                state_probability = (state_bucket["success"] + self.base_hit_probability * prior_strength) / (state_bucket["total"] + prior_strength)
+
+            recent_hits = current_state[0]
+            recent_factor = 1.0 + ((recent_hits - (state_window * self.base_hit_probability)) / max(state_window, 1)) * 0.35
+            transition_factor = max(transition_probability / self.base_hit_probability, 0.35)
+            state_factor = max(state_probability / self.base_hit_probability, 0.35)
+            gap_factor = max(gap_probability / self.base_hit_probability, 0.35)
+            overall_factor = max(overall_probability / self.base_hit_probability, 0.35)
+            raw_scores[number] = max(
+                (transition_factor ** 0.58)
+                * (state_factor ** 0.92)
+                * (gap_factor ** 0.74)
+                * (overall_factor ** 0.36)
+                * max(recent_factor, 0.78),
+                1e-12,
+            )
+
+        raw_total = sum(raw_scores.values())
+        if raw_total <= 0:
+            for number in self.universe:
+                lookup[number] = self.base_hit_probability
+            return lookup
+
+        for number in self.universe:
+            normalized_probability = 6.0 * raw_scores[number] / raw_total
+            lookup[number] = min(max(normalized_probability, 0.015), 0.42)
+        # 클리핑 후 재정규화: 확률 합이 정확히 6.0이 되도록 보정
+        clipped_total = sum(lookup[number] for number in self.universe)
+        if clipped_total > 0:
+            scale = 6.0 / clipped_total
+            for number in self.universe:
+                lookup[number] = min(max(lookup[number] * scale, 0.015), 0.42)
+        return lookup
+
+    def _build_probability_group_profiles(self):
+        ranked_numbers = sorted(self.universe, key=lambda number: self.projected_probability_lookup[number], reverse=True)
+        groups = {
+            "high": ranked_numbers[:15],
+            "mid": ranked_numbers[15:30],
+            "low": ranked_numbers[30:],
+        }
+        membership = [""] * 46
+        for group_name, numbers in groups.items():
+            for number in numbers:
+                membership[number] = group_name
+
+        mean_probability = {
+            group_name: (
+                sum(self.projected_probability_lookup[number] for number in numbers) / len(numbers) if numbers else self.base_hit_probability
+            )
+            for group_name, numbers in groups.items()
+        }
+
+        history_window = min(len(self.rows), 180)
+        recent_window = min(len(self.rows), 45)
+        quota_counter = Counter()
+        recent_quota_counter = Counter()
+
+        for idx, row in enumerate(self.rows[:history_window]):
+            counts = {"high": 0, "mid": 0, "low": 0}
+            for number in row:
+                group_name = membership[number] or "low"
+                counts[group_name] += 1
+            quota = (counts["high"], counts["mid"], counts["low"])
+            quota_counter[quota] += 1
+            if idx < recent_window:
+                recent_quota_counter[quota] += 1
+
+        quota_scores = {}
+        ranked_quotas = []
+        positive_score_total = 0.0
+        for high_count in range(7):
+            for mid_count in range(7 - high_count):
+                low_count = 6 - high_count - mid_count
+                quota = (high_count, mid_count, low_count)
+                quota_prob_mass = (
+                    mean_probability["high"] * high_count
+                    + mean_probability["mid"] * mid_count
+                    + mean_probability["low"] * low_count
+                )
+                history_freq = quota_counter.get(quota, 0) / max(history_window, 1)
+                recent_freq = recent_quota_counter.get(quota, 0) / max(recent_window, 1)
+                spread = max(quota) - min(quota)
+                balance_bonus = (1.0 - (spread / 6.0)) * 0.10
+                concentration_penalty = 0.0
+                if max(quota) >= 6:
+                    concentration_penalty += 0.04 * (max(quota) - 5)
+                if min(quota) == 0:
+                    concentration_penalty += 0.01
+                efficiency = (quota_prob_mass * 2.32) + (history_freq * 0.72) + (recent_freq * 0.88) + balance_bonus - concentration_penalty
+                quota_scores[quota] = efficiency
+                ranked_quotas.append((quota, efficiency))
+                positive_score_total += max(efficiency, 0.0)
+
+        ranked_quotas.sort(key=lambda item: item[1], reverse=True)
+        top_share = (max(ranked_quotas[0][1], 0.0) / max(positive_score_total, 1e-9)) if ranked_quotas else 0.0
+        exploration_rate = min(max(0.12 + (top_share * 0.14), 0.12), 0.22)
+        exploration_pool_size = max(6, min(len(ranked_quotas), 10)) if ranked_quotas else 0
+        exploration_ranked_quotas = []
+        for rank, (quota, efficiency) in enumerate(ranked_quotas[:exploration_pool_size]):
+            exploration_bonus = max(0.0, 0.18 - (rank * 0.012))
+            exploration_ranked_quotas.append((quota, efficiency + exploration_bonus))
+
+        return {
+            "groups": groups,
+            "membership": membership,
+            "quota_scores": quota_scores,
+            "ranked_quotas": ranked_quotas,
+            "exploration_rate": exploration_rate,
+            "exploration_ranked_quotas": exploration_ranked_quotas,
+        }
+
+    def _sample_group_portfolio_ticket(self, quota):
+        groups = self.probability_group_profiles.get("groups", {})
+        exploration_rate = float(self.probability_group_profiles.get("exploration_rate", 0.24))
+        selected = []
+        score = 0.0
+        latest_row = set(self.rows[0]) if self.rows else set()
+
+        for group_name, pick_count in zip(("high", "mid", "low"), quota):
+            if pick_count <= 0:
+                continue
+            available = [number for number in groups.get(group_name, []) if number not in selected]
+            for _ in range(pick_count):
+                if not available:
+                    break
+                deterministic_weights = []
+                sampled_weights = []
+                current_position = min(len(selected), 5)
+                for number in available:
+                    projected_weight = max(self.projected_probability_lookup[number] / self.base_hit_probability, 1e-12)
+                    position_weight = max(self.base_position_weights[current_position][number], 1e-12)
+                    pair_factor = self._normalized_pair_factor(number, selected)
+                    carry_over_penalty = 0.97 if number in latest_row else 1.0
+                    weight = max(
+                        (projected_weight ** 1.08)
+                        * (position_weight ** 0.96)
+                        * (pair_factor ** 0.20)
+                        * carry_over_penalty,
+                        1e-12,
+                    )
+                    deterministic_weights.append(weight)
+                    exploration_noise = random.uniform(1.0 - (0.03 * exploration_rate), 1.0 + (0.10 * exploration_rate))
+                    sampled_weights.append((weight ** max(0.90, 1.0 - (0.16 * exploration_rate))) * exploration_noise)
+                if sum(sampled_weights) <= 0:
+                    sampled_weights = [1.0] * len(available)
+                selected_index = random.choices(range(len(available)), weights=sampled_weights, k=1)[0]
+                selected_number = available.pop(selected_index)
+                selected.append(selected_number)
+                score += math.log(max(deterministic_weights[selected_index], 1e-12))
+
+        return sorted(selected), score
+
+    def _safety_correction_score(self, numbers):
+        features = self._ticket_features(numbers)
+        odd_count = features["odd_count"]
+        lower_half_count = features["lower_half_count"]
+        consecutive_pairs = features["consecutive_pairs"]
+        max_decade = features["max_decade"]
+        latest_overlap = features["latest_overlap"]
+
+        score = 0.0
+        if odd_count in (2, 3, 4):
+            score += 0.10
+        else:
+            score -= 0.07
+        if lower_half_count in (2, 3, 4):
+            score += 0.08
+        else:
+            score -= 0.05
+        if consecutive_pairs <= 2:
+            score += 0.04
+        else:
+            score -= 0.09 * (consecutive_pairs - 2)
+        if max_decade >= 4:
+            score -= 0.10 * (max_decade - 3)
+        if latest_overlap >= 3:
+            score -= 0.12 * (latest_overlap - 2)
+
+        dynamic_config = getattr(self, "dynamic_score_config", {}) or {}
+        if score < 0:
+            score *= float(dynamic_config.get("safety_penalty_scale", 1.0))
+        elif score > 0:
+            score *= float(dynamic_config.get("safety_reward_scale", 1.0))
+        return score
+
+    def _probability_portfolio_score(self, numbers, quota):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        quota_key = tuple(quota)
+        cache_key = (sorted_numbers, quota_key)
+        cached_score = self._probability_portfolio_score_cache.get(cache_key)
+        if cached_score is not None:
+            return cached_score
+
+        features = self._ticket_features(sorted_numbers)
+        quota_efficiency = self.probability_group_profiles.get("quota_scores", {}).get(quota_key, 0.0)
+        dynamic_config = getattr(self, "dynamic_score_config", {}) or {}
+        position_axis_weight = float(dynamic_config.get("position_axis_weight", 1.12))
+        pattern_signature_weight = float(dynamic_config.get("pattern_signature_weight", 0.82))
+        pair_axis_weight = float(dynamic_config.get("pair_axis_weight", 0.40))
+        quota_group_weight = float(dynamic_config.get("quota_group_weight", 0.46))
+        quota_efficiency_weight = float(dynamic_config.get("quota_efficiency_weight", 0.38))
+        score = (
+            (features["transition_log_score"] * 0.78)
+            + (features["probability_log_score"] * 0.88)
+            + (features["position_log_score"] * position_axis_weight)
+            + (features["pair_log_component"] * pair_axis_weight)
+            + (self._group_portfolio_score(sorted_numbers) * quota_group_weight)
+            + (self._giannella_pattern_score(sorted_numbers) * 0.44)
+            + (self._pattern_signature_score(sorted_numbers) * pattern_signature_weight)
+            + self._safety_correction_score(sorted_numbers)
+            + (quota_efficiency * quota_efficiency_weight)
+        )
+        self._probability_portfolio_score_cache[cache_key] = score
+        return score
+
+    def _refine_group_portfolio_ticket(self, seed_numbers, quota, iterations=18):
+        membership = self.probability_group_profiles.get("membership", [""] * 46)
+        current = sorted(int(number) for number in seed_numbers)
+        current_score = self._probability_portfolio_score(current, quota)
+        best_numbers = list(current)
+        best_score = current_score
+        temperature = 1.0
+
+        for _ in range(max(iterations, 8)):
+            candidate = current.copy()
+            remove_idx = random.randrange(len(candidate))
+            removed_number = candidate[remove_idx]
+            target_group = membership[removed_number] or "low"
+            replacement_pool = [
+                number for number in self.probability_group_profiles.get("groups", {}).get(target_group, [])
+                if number not in candidate and number != removed_number
+            ]
+            if not replacement_pool:
+                continue
+            candidate[remove_idx] = random.choice(replacement_pool)
+            candidate = sorted(candidate)
+            proposal_score = self._probability_portfolio_score(candidate, quota)
+            delta = proposal_score - current_score
+            if delta >= 0 or random.random() < math.exp(delta / max(temperature, 0.08)):
+                current = candidate
+                current_score = proposal_score
+                if proposal_score > best_score:
+                    best_numbers = list(candidate)
+                    best_score = proposal_score
+            temperature *= 0.92
+
+        return best_numbers, best_score
+
+    def _giannella_zone_index(self, number):
+        if number <= 9:
+            return 0
+        if number <= 19:
+            return 1
+        if number <= 29:
+            return 2
+        if number <= 39:
+            return 3
+        return 4
+
+    def _giannella_gap_bucket(self, gap):
+        if gap <= 1:
+            return 0
+        if gap <= 3:
+            return 1
+        if gap <= 6:
+            return 2
+        return 3
+
+    def _giannella_pattern_signature(self, numbers):
+        sorted_numbers = tuple(sorted(numbers))
+        zone_counts = [0] * 5
+        for number in sorted_numbers:
+            zone_counts[self._giannella_zone_index(number)] += 1
+        inner_gaps = [sorted_numbers[idx + 1] - sorted_numbers[idx] - 1 for idx in range(len(sorted_numbers) - 1)]
+        gap_signature = tuple(self._giannella_gap_bucket(gap) for gap in inner_gaps)
+        return tuple(zone_counts), gap_signature
+
+    def _build_giannella_pattern_stats(self):
+        zone_counter = Counter()
+        gap_counter = Counter()
+        odd_counter = Counter()
+        lower_half_counter = Counter()
+        consecutive_counter = Counter()
+        recent_zone_counter = Counter()
+        recent_gap_counter = Counter()
+        recent_odd_counter = Counter()
+        recent_lower_half_counter = Counter()
+        recent_consecutive_counter = Counter()
+        recent_window = min(len(self.rows), 90)
+
+        for idx, row in enumerate(self.rows):
+            sorted_row = sorted(row)
+            zone_signature, gap_signature = self._giannella_pattern_signature(sorted_row)
+            odd_count = sum(number % 2 for number in sorted_row)
+            lower_half_count = sum(1 for number in sorted_row if number <= 22)
+            consecutive_pairs = sum(1 for pos in range(len(sorted_row) - 1) if sorted_row[pos + 1] - sorted_row[pos] == 1)
+            zone_counter[zone_signature] += 1
+            gap_counter[gap_signature] += 1
+            odd_counter[odd_count] += 1
+            lower_half_counter[lower_half_count] += 1
+            consecutive_counter[consecutive_pairs] += 1
+            if idx < recent_window:
+                recent_zone_counter[zone_signature] += 1
+                recent_gap_counter[gap_signature] += 1
+                recent_odd_counter[odd_count] += 1
+                recent_lower_half_counter[lower_half_count] += 1
+                recent_consecutive_counter[consecutive_pairs] += 1
+
+        return {
+            "zone_counter": dict(zone_counter),
+            "gap_counter": dict(gap_counter),
+            "odd_counter": dict(odd_counter),
+            "lower_half_counter": dict(lower_half_counter),
+            "consecutive_counter": dict(consecutive_counter),
+            "recent_zone_counter": dict(recent_zone_counter),
+            "recent_gap_counter": dict(recent_gap_counter),
+            "recent_odd_counter": dict(recent_odd_counter),
+            "recent_lower_half_counter": dict(recent_lower_half_counter),
+            "recent_consecutive_counter": dict(recent_consecutive_counter),
+        }
+
+    def _build_giannella_segment_profiles(self):
+        signature_counter = Counter()
+        recent_signature_counter = Counter()
+        recent_window = min(len(self.rows), 120)
+
+        for idx, row in enumerate(self.rows):
+            sorted_row = sorted(int(number) for number in row)
+            zone_signature, gap_signature = self._giannella_pattern_signature(sorted_row)
+            odd_count = sum(number % 2 for number in sorted_row)
+            lower_half_count = sum(1 for number in sorted_row if number <= 22)
+            consecutive_pairs = sum(1 for pos in range(len(sorted_row) - 1) if sorted_row[pos + 1] - sorted_row[pos] == 1)
+            signature = (zone_signature, gap_signature, odd_count, lower_half_count, consecutive_pairs)
+            signature_counter[signature] += 1
+            if idx < recent_window:
+                recent_signature_counter[signature] += 1
+
+        ranked_signatures = []
+        for signature, count in signature_counter.items():
+            score = 1.0 + float(count) + float(recent_signature_counter.get(signature, 0)) * 2.45
+            ranked_signatures.append((signature, score))
+        ranked_signatures.sort(key=lambda item: item[1], reverse=True)
+        return {
+            "signature_counter": dict(signature_counter),
+            "recent_signature_counter": dict(recent_signature_counter),
+            "ranked_signatures": ranked_signatures,
+        }
+
+    def _giannella_pattern_score(self, numbers):
+        features = self._ticket_features(numbers)
+        zone_signature = features["zone_signature"]
+        gap_signature = features["gap_signature"]
+        odd_count = features["odd_count"]
+        lower_half_count = features["lower_half_count"]
+        consecutive_pairs = features["consecutive_pairs"]
+        zone_counter = self.giannella_pattern_stats.get("zone_counter", {})
+        gap_counter = self.giannella_pattern_stats.get("gap_counter", {})
+        odd_counter = self.giannella_pattern_stats.get("odd_counter", {})
+        lower_half_counter = self.giannella_pattern_stats.get("lower_half_counter", {})
+        consecutive_counter = self.giannella_pattern_stats.get("consecutive_counter", {})
+        recent_zone_counter = self.giannella_pattern_stats.get("recent_zone_counter", {})
+        recent_gap_counter = self.giannella_pattern_stats.get("recent_gap_counter", {})
+        recent_odd_counter = self.giannella_pattern_stats.get("recent_odd_counter", {})
+        recent_lower_half_counter = self.giannella_pattern_stats.get("recent_lower_half_counter", {})
+        recent_consecutive_counter = self.giannella_pattern_stats.get("recent_consecutive_counter", {})
+
+        zone_weight = 1.0 + float(zone_counter.get(zone_signature, 0)) + float(recent_zone_counter.get(zone_signature, 0)) * 2.2
+        gap_weight = 1.0 + float(gap_counter.get(gap_signature, 0)) + float(recent_gap_counter.get(gap_signature, 0)) * 1.8
+        odd_weight = 1.0 + float(odd_counter.get(odd_count, 0)) + float(recent_odd_counter.get(odd_count, 0)) * 1.3
+        lower_half_weight = 1.0 + float(lower_half_counter.get(lower_half_count, 0)) + float(recent_lower_half_counter.get(lower_half_count, 0)) * 1.2
+        consecutive_weight = 1.0 + float(consecutive_counter.get(consecutive_pairs, 0)) + float(recent_consecutive_counter.get(consecutive_pairs, 0)) * 1.1
+        return (
+            math.log(zone_weight) * 1.02
+            + math.log(gap_weight) * 0.84
+            + math.log(odd_weight) * 0.34
+            + math.log(lower_half_weight) * 0.28
+            + math.log(consecutive_weight) * 0.22
+        )
+
+    def _pattern_span_bucket(self, span):
+        if span <= 18:
+            return 0
+        if span <= 24:
+            return 1
+        if span <= 30:
+            return 2
+        if span <= 36:
+            return 3
+        return 4
+
+    def _pattern_signature(self, numbers):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        zone_counts = [0] * 5
+        for number in sorted_numbers:
+            zone_counts[self._giannella_zone_index(number)] += 1
+        gaps = [sorted_numbers[idx + 1] - sorted_numbers[idx] - 1 for idx in range(len(sorted_numbers) - 1)]
+        tight_gaps = sum(1 for gap in gaps if gap <= 2)
+        mid_gaps = sum(1 for gap in gaps if 3 <= gap <= 5)
+        wide_gaps = sum(1 for gap in gaps if gap >= 6)
+        max_gap_bucket = self._giannella_gap_bucket(max(gaps) if gaps else 0)
+        span_bucket = self._pattern_span_bucket(sorted_numbers[-1] - sorted_numbers[0]) if sorted_numbers else 0
+        zone_density = tuple(min(count, 3) for count in zone_counts)
+        gap_profile = (tight_gaps, mid_gaps, wide_gaps, max_gap_bucket)
+        edge_balance = sum(1 for number in sorted_numbers if number <= 10 or number >= 36)
+        consecutive_pairs = sum(1 for idx in range(len(sorted_numbers) - 1) if sorted_numbers[idx + 1] - sorted_numbers[idx] == 1)
+        return zone_density, gap_profile, span_bucket, edge_balance, consecutive_pairs
+
+    def _build_pattern_signature_stats(self):
+        signature_counter = Counter()
+        zone_counter = Counter()
+        gap_counter = Counter()
+        span_counter = Counter()
+        edge_counter = Counter()
+        recent_signature_counter = Counter()
+        recent_zone_counter = Counter()
+        recent_gap_counter = Counter()
+        recent_span_counter = Counter()
+        recent_edge_counter = Counter()
+        recent_window = min(len(self.rows), 120)
+
+        for idx, row in enumerate(self.rows):
+            signature = self._pattern_signature(row)
+            zone_density, gap_profile, span_bucket, edge_balance, _consecutive_pairs = signature
+            signature_counter[signature] += 1
+            zone_counter[zone_density] += 1
+            gap_counter[gap_profile] += 1
+            span_counter[span_bucket] += 1
+            edge_counter[edge_balance] += 1
+            if idx < recent_window:
+                recent_signature_counter[signature] += 1
+                recent_zone_counter[zone_density] += 1
+                recent_gap_counter[gap_profile] += 1
+                recent_span_counter[span_bucket] += 1
+                recent_edge_counter[edge_balance] += 1
+
+        return {
+            "signature_counter": dict(signature_counter),
+            "zone_counter": dict(zone_counter),
+            "gap_counter": dict(gap_counter),
+            "span_counter": dict(span_counter),
+            "edge_counter": dict(edge_counter),
+            "recent_signature_counter": dict(recent_signature_counter),
+            "recent_zone_counter": dict(recent_zone_counter),
+            "recent_gap_counter": dict(recent_gap_counter),
+            "recent_span_counter": dict(recent_span_counter),
+            "recent_edge_counter": dict(recent_edge_counter),
+        }
+
+    def _pattern_signature_score(self, numbers):
+        signature = self._pattern_signature(numbers)
+        zone_density, gap_profile, span_bucket, edge_balance, _consecutive_pairs = signature
+        signature_counter = self.pattern_signature_stats.get("signature_counter", {})
+        zone_counter = self.pattern_signature_stats.get("zone_counter", {})
+        gap_counter = self.pattern_signature_stats.get("gap_counter", {})
+        span_counter = self.pattern_signature_stats.get("span_counter", {})
+        edge_counter = self.pattern_signature_stats.get("edge_counter", {})
+        recent_signature_counter = self.pattern_signature_stats.get("recent_signature_counter", {})
+        recent_zone_counter = self.pattern_signature_stats.get("recent_zone_counter", {})
+        recent_gap_counter = self.pattern_signature_stats.get("recent_gap_counter", {})
+        recent_span_counter = self.pattern_signature_stats.get("recent_span_counter", {})
+        recent_edge_counter = self.pattern_signature_stats.get("recent_edge_counter", {})
+
+        signature_weight = 1.0 + float(signature_counter.get(signature, 0)) + float(recent_signature_counter.get(signature, 0)) * 1.55
+        zone_weight = 1.0 + float(zone_counter.get(zone_density, 0)) + float(recent_zone_counter.get(zone_density, 0)) * 1.35
+        gap_weight = 1.0 + float(gap_counter.get(gap_profile, 0)) + float(recent_gap_counter.get(gap_profile, 0)) * 1.20
+        span_weight = 1.0 + float(span_counter.get(span_bucket, 0)) + float(recent_span_counter.get(span_bucket, 0)) * 0.95
+        edge_weight = 1.0 + float(edge_counter.get(edge_balance, 0)) + float(recent_edge_counter.get(edge_balance, 0)) * 0.80
+        return (
+            math.log(signature_weight) * 1.02
+            + math.log(zone_weight) * 0.74
+            + math.log(gap_weight) * 0.68
+            + math.log(span_weight) * 0.28
+            + math.log(edge_weight) * 0.18
+        )
+
+    def _group_bucket_index(self, number):
+        return min((int(number) - 1) // 15, 2)
+
+    def _group_portfolio_signature(self, numbers):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        group_counts = [0] * 3
+        odd_count = 0
+        lower_half_count = 0
+        consecutive_pairs = 0
+        for idx, number in enumerate(sorted_numbers):
+            group_counts[self._group_bucket_index(number)] += 1
+            odd_count += number % 2
+            if number <= 22:
+                lower_half_count += 1
+            if idx and number - sorted_numbers[idx - 1] == 1:
+                consecutive_pairs += 1
+        return tuple(group_counts), odd_count, lower_half_count, consecutive_pairs
+
+    def _build_group_portfolio_stats(self):
+        signature_counter = Counter()
+        recent_signature_counter = Counter()
+        recent_window = min(len(self.rows), 120)
+        for idx, row in enumerate(self.rows):
+            signature = self._group_portfolio_signature(row)
+            signature_counter[signature] += 1
+            if idx < recent_window:
+                recent_signature_counter[signature] += 1
+        return {
+            "signature_counter": dict(signature_counter),
+            "recent_signature_counter": dict(recent_signature_counter),
+        }
+
+    def _group_portfolio_score(self, numbers):
+        features = self._ticket_features(numbers)
+        signature = features["group_signature"]
+        signature_counter = self.group_portfolio_stats.get("signature_counter", {})
+        recent_signature_counter = self.group_portfolio_stats.get("recent_signature_counter", {})
+        signature_weight = 1.0 + float(signature_counter.get(signature, 0)) + float(recent_signature_counter.get(signature, 0)) * 1.8
+        return math.log(signature_weight)
+
+    def _build_probability_weight_lookup(self):
+        lookup = [0.0] * 46
+        for number in self.universe:
+            projected_factor = max(self.projected_probability_lookup[number] / self.base_hit_probability, 1e-12)
+            transition_factor = max(self.markov_transition_weight_lookup[number], 1e-12)
+            gap_factor = max(self.gap_factor_lookup[number], 1e-12)
+            lookup[number] = max((projected_factor ** 1.25) * (transition_factor ** 0.65) * (gap_factor ** 0.50), 1e-9)
+
+        # 정규화: 평균 가중치가 1.0이 되도록 조정 (상대적 비교 기준 유지)
+        mean_weight = sum(lookup[number] for number in self.universe) / len(self.universe)
+        if mean_weight > 0:
+            for number in self.universe:
+                lookup[number] /= mean_weight
+        return lookup
+
+    def _build_base_position_weights(self):
+        weights = [[0.0] * 46 for _ in range(6)]
+        recent_window = min(len(self.rows), 90)
+        recent_rows = self.rows[:recent_window]
+        recent_position_counters = [Counter() for _ in range(6)]
+        for row in recent_rows:
+            sorted_row = sorted(int(number) for number in row)
+            for position, number in enumerate(sorted_row):
+                recent_position_counters[position][number] += 1
+
+        historical_position_totals = [sum(counter.values()) for counter in self.position_counters]
+        recent_position_totals = [sum(counter.values()) for counter in recent_position_counters]
+
+        for position in range(6):
+            historical_avg = max(historical_position_totals[position] / 45.0, 1e-6)
+            recent_avg = max(recent_position_totals[position] / 45.0, 1e-6)
+            raw_row_values = []
+            for number in self.universe:
+                total_f = (self.total_counter[number] + 1.0) / (self.avg_total_freq + 1.0)
+                position_f = (self.position_counters[position][number] + 1.0) / (historical_avg + 1.0)
+                recent_f = (recent_position_counters[position][number] + 1.0) / (recent_avg + 1.0)
+                gap_f = max(self.gap_factor_lookup[number], 1e-12)
+                value = max(
+                    (position_f ** 1.16)
+                    * (recent_f ** 0.92)
+                    * (total_f ** 0.34)
+                    * (gap_f ** 0.58),
+                    1e-9,
+                )
+                weights[position][number] = value
+                raw_row_values.append(value)
+            row_mean = sum(raw_row_values) / len(raw_row_values) if raw_row_values else 1.0
+            if row_mean > 0:
+                for number in self.universe:
+                    weights[position][number] /= row_mean
+        return weights
+
+    def _build_log_lookup(self, values, normalize_by_base=False):
+        lookup = [0.0] * 46
+        for number in self.universe:
+            value = float(values[number])
+            if normalize_by_base:
+                value /= self.base_hit_probability
+            lookup[number] = math.log(max(value, 1e-12))
+        return lookup
+
+    def _build_pair_log_matrix(self):
+        matrix = [[0.0] * 46 for _ in range(46)]
+        for left in self.universe:
+            source_row = self.pair_strength_matrix[left]
+            target_row = matrix[left]
+            for right in self.universe:
+                target_row[right] = math.log(max(min(source_row[right], 1.13), 0.91))
+        return matrix
+
+    def _normalized_pair_factor(self, number, selected=None):
+        selected = [int(n) for n in (selected or []) if int(n) in self.universe and int(n) != int(number)]
+        if not selected:
+            return 1.0
+        pair_strength = sum(self.pair_strength_matrix[int(number)][picked] for picked in selected) / len(selected)
+        return min(max(pair_strength, 0.92), 1.10)
+
+    def _ticket_features(self, numbers):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        cached = self._ticket_feature_cache.get(sorted_numbers)
+        if cached is not None:
+            return cached
+
+        zone_counts = [0] * 5
+        group_counts = [0] * 3
+        decade_counts = [0] * 5
+        odd_count = 0
+        lower_half_count = 0
+        consecutive_pairs = 0
+        latest_overlap = 0
+        gap_signature = []
+        probability_log_score = 0.0
+        transition_log_score = 0.0
+        position_log_score = 0.0
+
+        previous_number = None
+        for position, number in enumerate(sorted_numbers):
+            zone_counts[self._giannella_zone_index(number)] += 1
+            group_counts[self._group_bucket_index(number)] += 1
+            decade_counts[(number - 1) // 10] += 1
+            odd_count += number % 2
+            lower_half_count += 1 if number <= 22 else 0
+            latest_overlap += 1 if number in self.latest_row_set else 0
+            probability_log_score += self._projected_log_lookup[number]
+            transition_log_score += (
+                self._transition_log_lookup[number]
+                + self._state_log_lookup[number] * 0.55
+                + self._anchor_log_lookup[number] * 0.45
+            )
+            position_log_score += math.log(max(self.base_position_weights[position][number], 1e-12))
+            if previous_number is not None:
+                gap_signature.append(self._giannella_gap_bucket(number - previous_number - 1))
+                if number - previous_number == 1:
+                    consecutive_pairs += 1
+            previous_number = number
+
+        pair_log_sum = 0.0
+        for idx in range(len(sorted_numbers)):
+            left = sorted_numbers[idx]
+            for jdx in range(idx + 1, len(sorted_numbers)):
+                pair_log_sum += self._pair_log_matrix[left][sorted_numbers[jdx]]
+
+        features = {
+            "sorted_numbers": sorted_numbers,
+            "zone_signature": tuple(zone_counts),
+            "gap_signature": tuple(gap_signature),
+            "odd_count": odd_count,
+            "lower_half_count": lower_half_count,
+            "consecutive_pairs": consecutive_pairs,
+            "group_signature": (tuple(group_counts), odd_count, lower_half_count, consecutive_pairs),
+            "max_decade": max(decade_counts) if decade_counts else 0,
+            "latest_overlap": latest_overlap,
+            "probability_log_score": probability_log_score,
+            "transition_log_score": transition_log_score,
+            "position_log_score": position_log_score,
+            "pair_log_component": pair_log_sum / 15.0,
+        }
+        self._ticket_feature_cache[sorted_numbers] = features
+        return features
+
+    def _simulation_profile(self, simulation_count, sets=5):
+        simulation_count = _sanitize_simulation_count(simulation_count)
+        quota_pool_size = max(3, min(10, 3 + (simulation_count // 2600)))
+        segment_pool_size = max(4, min(18, 4 + (simulation_count // 1800)))
+        candidate_iterations = min(max(sets * 120, 800 + (simulation_count // 2)), 7200)
+        refine_iterations = 10 + min(simulation_count // 2200, 10)
+        markov_mix = min(0.42, 0.18 + (simulation_count / 42000.0))
+        giannella_mix = min(0.46, 0.26 + (simulation_count / 36000.0))
+        return {
+            "simulation_count": simulation_count,
+            "quota_pool_size": quota_pool_size,
+            "segment_pool_size": segment_pool_size,
+            "candidate_iterations": candidate_iterations,
+            "refine_iterations": refine_iterations,
+            "markov_mix": markov_mix,
+            "giannella_mix": giannella_mix,
+        }
+
+    def _group_quota_from_numbers(self, numbers):
+        membership = self.probability_group_profiles.get("membership", [""] * 46)
+        counts = {"high": 0, "mid": 0, "low": 0}
+        for number in numbers:
+            counts[membership[number] or "low"] += 1
+        return counts["high"], counts["mid"], counts["low"]
+
+    def _candidate_core_weight(self, number, selected=None):
+        selected = selected or []
+        projected_factor = max(self.projected_probability_lookup[number] / self.base_hit_probability, 1e-12)
+        probability_factor = max(self.probability_weight_lookup[number], 1e-12)
+        transition_factor = max(self.markov_transition_weight_lookup[number], 1e-12)
+        gap_factor = max(self.gap_factor_lookup[number], 1e-12)
+        pair_factor = self._normalized_pair_factor(number, selected)
+        latest_penalty = 0.95 if self.rows and number in self.rows[0] else 1.0
+        return max(
+            (projected_factor ** 0.78)
+            * (probability_factor ** 0.92)
+            * (transition_factor ** 0.88)
+            * (gap_factor ** 0.36)
+            * (pair_factor ** 0.35)
+            * latest_penalty,
+            1e-12,
+        )
+
+    def _sample_giannella_segment_ticket(self, segment_signature):
+        zone_signature, _gap_signature, odd_target, lower_half_target, consecutive_target = segment_signature
+        selected = []
+        score = 0.0
+        zone_pools = {
+            0: list(range(1, 10)),
+            1: list(range(10, 20)),
+            2: list(range(20, 30)),
+            3: list(range(30, 40)),
+            4: list(range(40, 46)),
+        }
+
+        for zone_index, pick_count in enumerate(zone_signature):
+            if pick_count <= 0:
+                continue
+            available = [number for number in zone_pools.get(zone_index, []) if number not in selected]
+            for _ in range(pick_count):
+                if not available:
+                    break
+                deterministic_weights = []
+                sampled_weights = []
+                for number in available:
+                    weight = self._candidate_core_weight(number, selected)
+                    if (number % 2) == (odd_target % 2):
+                        weight *= 1.02
+                    if (number <= 22) == (len([n for n in selected if n <= 22]) < lower_half_target):
+                        weight *= 1.03
+                    deterministic_weights.append(weight)
+                    sampled_weights.append(weight * random.uniform(0.987, 1.013))
+                selected_index = random.choices(range(len(available)), weights=sampled_weights, k=1)[0]
+                picked_number = available.pop(selected_index)
+                selected.append(picked_number)
+                score += math.log(max(deterministic_weights[selected_index], 1e-12))
+
+        while len(selected) < 6:
+            available = [number for number in self.universe if number not in selected]
+            deterministic_weights = [self._candidate_core_weight(number, selected) for number in available]
+            sampled_weights = [weight * random.uniform(0.987, 1.013) for weight in deterministic_weights]
+            selected_index = random.choices(range(len(available)), weights=sampled_weights, k=1)[0]
+            selected.append(available[selected_index])
+            score += math.log(max(deterministic_weights[selected_index], 1e-12))
+
+        selected = sorted(selected)
+        gap_penalty = 0.0
+        actual_consecutive_pairs = sum(1 for idx in range(len(selected) - 1) if selected[idx + 1] - selected[idx] == 1)
+        if actual_consecutive_pairs > consecutive_target + 1:
+            gap_penalty -= 0.18 * (actual_consecutive_pairs - consecutive_target)
+        return selected, score + self._giannella_pattern_score(selected) + gap_penalty
+
+    def _current_gap_factor(self, number):
+        return self.gap_factor_lookup[number]
+
+    def _probability_only_weight(self, number):
+        return self.probability_weight_lookup[number]
+
+    def average_gap_factor(self, numbers):
+        numbers = [int(n) for n in numbers if int(n) in self.universe]
+        if not numbers:
+            return 0.0
+        return round(sum(self._current_gap_factor(n) for n in numbers) / len(numbers), 6)
+
+    def average_probability_weight(self, numbers):
+        numbers = [int(n) for n in numbers if int(n) in self.universe]
+        if not numbers:
+            return 0.0
+        return round(sum(self._probability_only_weight(n) for n in numbers) / len(numbers), 6)
+
+    def _number_weight(self, number, position, selected=None, probability_only=False):
+        selected = [int(n) for n in (selected or []) if int(n) in self.universe and int(n) != int(number)]
+        number = int(number)
+        position = max(0, min(int(position), 5))
+
+        gap_factor = max(self._current_gap_factor(number), 1e-12)
+        probability_factor = max(self._probability_only_weight(number), 1e-12)
+        latest_penalty = 0.95 if self.rows and number in self.rows[0] else 1.0
+
+        if probability_only:
+            return max((probability_factor ** 1.1) * (gap_factor ** 0.45) * latest_penalty, 1e-12)
+
+        base_weight = max(self.base_position_weights[position][number], 1e-12)
+        transition_weight = max(self._markov_chain_weight(number, selected), 1e-12)
+        pair_factor = self._normalized_pair_factor(number, selected)
+
+        return max(
+            (base_weight ** 1.0)
+            * (probability_factor ** 0.85)
+            * (transition_weight ** 0.75)
+            * (pair_factor ** 0.35)
+            * (gap_factor ** 0.25)
+            * latest_penalty,
+            1e-12,
+        )
+
+    def _markov_chain_weight(self, number, anchors=None):
+        anchors = anchors or []
+        latest_transition = self.latest_row_transition_lookup[number]
+        latest_factor = max(latest_transition / self.base_hit_probability, 0.55)
+
+        if anchors:
+            anchor_transition = sum(self.markov_transition_matrix[source][number] for source in anchors) / len(anchors)
+            anchor_factor = max(anchor_transition / self.base_hit_probability, 0.55)
+        else:
+            anchor_factor = 1.0
+
+        markov_weight = max(self.markov_transition_weight_lookup[number], 1e-12)
+        probability_weight = max(self.probability_weight_lookup[number], 1e-12)
+        return max((markov_weight ** 0.9) * (probability_weight ** 0.4) * (latest_factor ** 0.6) * (anchor_factor ** 0.45), 1e-12)
+
+    def _sample_markov_seed_ticket(self):
+        available = self.universe.copy()
+        picked = []
+        score = 0.0
+        for _ in range(6):
+            deterministic_weights = [self._markov_chain_weight(number, picked) for number in available]
+            sampled_weights = [weight * random.uniform(0.985, 1.015) for weight in deterministic_weights]
+            if sum(sampled_weights) <= 0:
+                sampled_weights = [1.0] * len(available)
+            selected_index = random.choices(range(len(available)), weights=sampled_weights, k=1)[0]
+            selected_number = available.pop(selected_index)
+            picked.append(selected_number)
+            score += math.log(max(deterministic_weights[selected_index], 1e-12))
+        return sorted(picked), score
+
+    def _build_probability_direct_profile(self, simulation_count, sets=5):
+        simulation_count = _sanitize_simulation_count(simulation_count)
+        min_simulation_count = 1000
+        max_simulation_count = 50000
+        sim_range = max(max_simulation_count - min_simulation_count, 1)
+        normalized_scale = min(max((simulation_count - min_simulation_count) / sim_range, 0.0), 1.0)
+        candidate_iterations = min(max(sets * 140, 900 + (simulation_count // 3)), 4800)
+        repair_iterations = 2 + int(normalized_scale * 4)
+        segment_pool_size = max(4, min(14, 4 + (simulation_count // 2500)))
+        transition_sharpness = 1.0 + (normalized_scale * 0.32)
+        transition_weight = 1.08 + (normalized_scale * 0.24)
+        pattern_weight = 0.84 + (normalized_scale * 0.36)
+        segment_weight = 0.22 + (normalized_scale * 0.18)
+        noise_span = max(0.0015, 0.010 - (normalized_scale * 0.006))
+        return {
+            "simulation_count": simulation_count,
+            "normalized_scale": normalized_scale,
+            "candidate_iterations": candidate_iterations,
+            "repair_iterations": repair_iterations,
+            "segment_pool_size": segment_pool_size,
+            "transition_sharpness": transition_sharpness,
+            "transition_weight": transition_weight,
+            "pattern_weight": pattern_weight,
+            "segment_weight": segment_weight,
+            "noise_span": noise_span,
+            "cache_bucket": round(normalized_scale, 3),
+        }
+
+    def _probability_segment_match_score(self, numbers, segment_signature):
+        if not segment_signature:
+            return 0.0
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        zone_signature_target, gap_signature_target, odd_target, lower_half_target, consecutive_target = segment_signature
+        zone_signature_actual, gap_signature_actual = self._giannella_pattern_signature(sorted_numbers)
+        odd_actual = sum(number % 2 for number in sorted_numbers)
+        lower_half_actual = sum(1 for number in sorted_numbers if number <= 22)
+        consecutive_actual = sum(
+            1 for idx in range(len(sorted_numbers) - 1) if sorted_numbers[idx + 1] - sorted_numbers[idx] == 1
+        )
+        zone_distance = sum(abs(left - right) for left, right in zip(zone_signature_actual, zone_signature_target))
+        gap_distance = sum(abs(left - right) for left, right in zip(gap_signature_actual, gap_signature_target))
+        odd_distance = abs(odd_actual - odd_target)
+        lower_half_distance = abs(lower_half_actual - lower_half_target)
+        consecutive_distance = abs(consecutive_actual - consecutive_target)
+        return 1.0 / (
+            1.0
+            + (zone_distance * 0.90)
+            + (gap_distance * 0.72)
+            + (odd_distance * 0.45)
+            + (lower_half_distance * 0.34)
+            + (consecutive_distance * 0.52)
+        )
+
+    def _markov_transition_seed_weight(self, number, anchors, simulation_profile):
+        anchor_list = list(anchors) if anchors else list(self.rows[0]) if self.rows else []
+        latest_transition = max(self.latest_row_transition_lookup[number], 1e-12)
+        latest_factor = max(latest_transition / self.base_hit_probability, 0.35)
+        if anchor_list:
+            anchor_transition = sum(self.markov_transition_matrix[source][number] for source in anchor_list) / len(anchor_list)
+            anchor_factor = max(anchor_transition / self.base_hit_probability, 0.35)
+        else:
+            anchor_factor = latest_factor
+        recency_penalty = 0.96 if self.rows and number in self.rows[0] else 1.0
+        return max(
+            (latest_factor ** (0.92 * simulation_profile["transition_sharpness"]))
+            * (anchor_factor ** (1.08 * simulation_profile["transition_sharpness"]))
+            * recency_penalty,
+            1e-12,
+        )
+
+    def _sample_markov_giannella_ticket(self, segment_signature, simulation_profile):
+        if segment_signature is None:
+            ranked_segments = self.giannella_segment_profiles.get("ranked_signatures", [])
+            segment_signature = ranked_segments[0][0] if ranked_segments else ((1, 1, 1, 2, 1), (1, 1, 1, 1, 1), 3, 3, 0)
+
+        zone_signature, _gap_signature, odd_target, lower_half_target, _consecutive_target = segment_signature
+        zone_pools = {
+            0: list(range(1, 10)),
+            1: list(range(10, 20)),
+            2: list(range(20, 30)),
+            3: list(range(30, 40)),
+            4: list(range(40, 46)),
+        }
+        selected = []
+
+        for zone_index, pick_count in enumerate(zone_signature):
+            if pick_count <= 0:
+                continue
+            for _ in range(pick_count):
+                available = [number for number in zone_pools.get(zone_index, []) if number not in selected]
+                if not available:
+                    break
+                weights = []
+                for number in available:
+                    weight = self._markov_transition_seed_weight(number, selected, simulation_profile)
+                    current_odd = sum(value % 2 for value in selected)
+                    current_lower_half = sum(1 for value in selected if value <= 22)
+                    remaining_slots = max(6 - len(selected), 1)
+                    if current_odd < odd_target and (number % 2 == 1):
+                        weight *= 1.04 + (0.02 / remaining_slots)
+                    if current_lower_half < lower_half_target and number <= 22:
+                        weight *= 1.03 + (0.02 / remaining_slots)
+                    weights.append(weight * random.uniform(1.0 - simulation_profile["noise_span"], 1.0 + simulation_profile["noise_span"]))
+                selected_number = random.choices(available, weights=weights, k=1)[0]
+                selected.append(selected_number)
+
+        while len(selected) < 6:
+            available = [number for number in self.universe if number not in selected]
+            weights = [
+                self._markov_transition_seed_weight(number, selected, simulation_profile)
+                * random.uniform(1.0 - simulation_profile["noise_span"], 1.0 + simulation_profile["noise_span"])
+                for number in available
+            ]
+            selected.append(random.choices(available, weights=weights, k=1)[0])
+
+        selected = sorted(selected)
+        score = self._probability_transition_score(selected, simulation_profile, segment_signature)
+        return selected, score
+
+    def _probability_transition_score(self, numbers, simulation_profile, segment_signature=None):
+        sorted_numbers = tuple(sorted(int(number) for number in numbers))
+        if len(sorted_numbers) != 6 or len(set(sorted_numbers)) != 6:
+            return -1e12
+
+        cache_key = (sorted_numbers, simulation_profile["cache_bucket"])
+        cached_score = self._probability_mcmc_score_cache.get(cache_key)
+        if cached_score is not None:
+            return cached_score
+
+        transition_score = 0.0
+        anchors = list(self.rows[0]) if self.rows else []
+        picked = []
+        for number in sorted_numbers:
+            weight = self._markov_transition_seed_weight(number, picked or anchors, simulation_profile)
+            transition_score += math.log(max(weight, 1e-12))
+            picked.append(number)
+
+        giannella_score = self._giannella_pattern_score(sorted_numbers)
+        segment_match_score = self._probability_segment_match_score(sorted_numbers, segment_signature)
+        total_score = (
+            (transition_score * simulation_profile["transition_weight"])
+            + (giannella_score * simulation_profile["pattern_weight"])
+            + (segment_match_score * simulation_profile["segment_weight"])
+        )
+        self._probability_mcmc_score_cache[cache_key] = total_score
+        return total_score
+
+    def _repair_markov_giannella_ticket(self, seed_numbers, segment_signature, simulation_profile):
+        current = sorted(int(number) for number in seed_numbers)
+        current_score = self._probability_transition_score(current, simulation_profile, segment_signature)
+        best_numbers = list(current)
+        best_score = current_score
+
+        zone_target = segment_signature[0] if segment_signature else None
+        odd_target = segment_signature[2] if segment_signature else None
+        lower_half_target = segment_signature[3] if segment_signature else None
+
+        for _ in range(max(simulation_profile["repair_iterations"], 2)):
+            candidate = current.copy()
+            remove_index = random.randrange(len(candidate))
+            retained = set(candidate)
+            retained.remove(candidate[remove_index])
+            replacement_pool = [number for number in self.universe if number not in retained]
+            if not replacement_pool:
+                continue
+
+            preferred_pool = replacement_pool
+            if zone_target:
+                current_zone_counts = [0] * 5
+                for number in retained:
+                    current_zone_counts[self._giannella_zone_index(number)] += 1
+                deficit_zones = [idx for idx, target in enumerate(zone_target) if current_zone_counts[idx] < target]
+                zone_filtered = [number for number in replacement_pool if self._giannella_zone_index(number) in deficit_zones]
+                if zone_filtered:
+                    preferred_pool = zone_filtered
+
+            weights = []
+            retained_list = sorted(retained)
+            current_odd = sum(number % 2 for number in retained_list)
+            current_lower_half = sum(1 for number in retained_list if number <= 22)
+            for number in preferred_pool:
+                weight = self._markov_transition_seed_weight(number, retained_list, simulation_profile)
+                if odd_target is not None and current_odd < odd_target and (number % 2 == 1):
+                    weight *= 1.04
+                if lower_half_target is not None and current_lower_half < lower_half_target and number <= 22:
+                    weight *= 1.03
+                weights.append(weight)
+
+            replacement_number = random.choices(preferred_pool, weights=weights, k=1)[0]
+            candidate[remove_index] = replacement_number
+            candidate = sorted(candidate)
+            proposal_score = self._probability_transition_score(candidate, simulation_profile, segment_signature)
+            if proposal_score >= current_score:
+                current = candidate
+                current_score = proposal_score
+                if proposal_score > best_score:
+                    best_numbers = list(candidate)
+                    best_score = proposal_score
+
+        return best_numbers, best_score
+
+    def _build_rolling_backtest_score_config(self):
+        defaults = {
+            "position_axis_weight": 1.12,
+            "pattern_signature_weight": 0.82,
+            "pair_axis_weight": 0.40,
+            "quota_group_weight": 0.46,
+            "quota_efficiency_weight": 0.38,
+            "safety_penalty_scale": 0.76,
+            "safety_reward_scale": 1.0,
+            "rolling_windows_evaluated": 0,
+        }
+        sample_size = min(max(len(self.rows) - 1, 0), 48)
+        if sample_size <= 0:
+            return defaults
+
+        quota_scores = self.probability_group_profiles.get("quota_scores", {})
+        recent_rows = [tuple(sorted(int(number) for number in row)) for row in self.rows[1 : 1 + sample_size]]
+        rng = random.Random(20260422)
+        random_samples_per_window = 28
+
+        actual_position = []
+        actual_pattern = []
+        actual_pair = []
+        actual_group = []
+        actual_quota = []
+        actual_overlap = []
+        baseline_position = []
+        baseline_pattern = []
+        baseline_pair = []
+        baseline_group = []
+        baseline_quota = []
+        baseline_overlap = []
+
+        for actual_numbers in recent_rows:
+            actual_features = self._ticket_features(actual_numbers)
+            actual_position.append(actual_features["position_log_score"])
+            actual_pattern.append(self._pattern_signature_score(actual_numbers))
+            actual_pair.append(actual_features["pair_log_component"])
+            actual_group.append(self._group_portfolio_score(actual_numbers))
+            actual_quota.append(quota_scores.get(self._group_quota_from_numbers(actual_numbers), 0.0))
+            actual_overlap.append(1.0 if actual_features["latest_overlap"] >= 3 else 0.0)
+
+            for _ in range(random_samples_per_window):
+                sampled_numbers = tuple(sorted(rng.sample(self.universe, 6)))
+                sampled_features = self._ticket_features(sampled_numbers)
+                baseline_position.append(sampled_features["position_log_score"])
+                baseline_pattern.append(self._pattern_signature_score(sampled_numbers))
+                baseline_pair.append(sampled_features["pair_log_component"])
+                baseline_group.append(self._group_portfolio_score(sampled_numbers))
+                baseline_quota.append(quota_scores.get(self._group_quota_from_numbers(sampled_numbers), 0.0))
+                baseline_overlap.append(1.0 if sampled_features["latest_overlap"] >= 3 else 0.0)
+
+        def _mean(values):
+            return (sum(values) / len(values)) if values else 0.0
+
+        def _ratio_boost(actual_values, baseline_values, strength, lower, upper):
+            baseline_mean = _mean(baseline_values)
+            relative_gap = (_mean(actual_values) - baseline_mean) / max(abs(baseline_mean), 1e-6)
+            return min(max(1.0 + (relative_gap * strength), lower), upper)
+
+        overlap_ratio = _mean(actual_overlap) / max(_mean(baseline_overlap), 1e-6)
+        defaults.update({
+            "position_axis_weight": _ratio_boost(actual_position, baseline_position, 0.68, 1.00, 1.45),
+            "pattern_signature_weight": _ratio_boost(actual_pattern, baseline_pattern, 0.30, 0.72, 1.02),
+            "pair_axis_weight": _ratio_boost(actual_pair, baseline_pair, 0.16, 0.28, 0.56),
+            "quota_group_weight": _ratio_boost(actual_group, baseline_group, 0.12, 0.26, 0.58),
+            "quota_efficiency_weight": _ratio_boost(actual_quota, baseline_quota, 0.10, 0.20, 0.48),
+            "safety_penalty_scale": min(max(0.56 + (overlap_ratio * 0.14), 0.56), 0.82),
+            "safety_reward_scale": 1.0,
+            "rolling_windows_evaluated": sample_size,
+        })
+        return defaults
+
+    def predict(self, sets=5, simulation_count: int | None = None):
+        self._probability_portfolio_score_cache = {}
+        simulation_count = _sanitize_simulation_count(simulation_count) if simulation_count is not None else DEFAULT_SIMULATION_COUNT
+        
+        # 새로운 패턴 분석 통계 생성
+        hot_cold_stats = self._build_advanced_pattern_stats()
+        
+        best_by_key = {}
+        # 시뮬레이션 규모에 따른 반복 횟수 설정
+        iterations = max(simulation_count * 2, 10000)
+        
+        for _ in range(iterations):
+            # 번호 선택 가중치: 핫(최근세), 콜드(미출현), 빈도 역수(희귀성)의 조화
+            weights = []
+            for n in self.universe:
+                stats = hot_cold_stats[n]
+                # 미래 예측 가중치: 핫(0.35) + 콜드(0.45) + 희귀성(0.2)
+                # 오랫동안 안 나온 번호(Cold)의 반등 가능성에 약간 더 무게를 둠
+                w = (stats["hot"] * 0.35 + stats["cold"] * 0.45 + (1.0/max(stats["rel_freq"], 0.1)) * 0.2)
+                weights.append(max(w, 0.001))
+            
+            # 6개 번호 무작위 추출 (가중치 적용)
+            try:
+                # 중복 없이 뽑기 위해 population과 weights 사용
+                combo = sorted(random.choices(self.universe, weights=weights, k=12)) # 넉넉히 뽑고 set으로 필터링
+                unique_combo = []
+                for num in combo:
+                    if num not in unique_combo:
+                        unique_combo.append(num)
+                    if len(unique_combo) == 6:
+                        break
+                if len(unique_combo) < 6: continue
+                combo = sorted(unique_combo)
+            except:
+                continue
+                
+            # 새로운 공식으로 점수 계산
+            score = self._advanced_pattern_score(combo)
+            key = tuple(combo)
+            
+            if key not in best_by_key or score > best_by_key[key]["score_raw"]:
+                best_by_key[key] = {
+                    "sorted": list(key),
+                    "ordered": None,
+                    "score_raw": score,
+                }
+        
+        # 점수 순 정렬 및 상위 N개 선택
+        ranked_candidates = sorted(best_by_key.values(), key=lambda x: x["score_raw"], reverse=True)
+        
+        final = []
+        selected_numbers = []
+        for candidate in ranked_candidates:
+            # 너무 유사한 조합(5개 이상 겹침)은 제외하여 다양성 확보
+            overlap = 0
+            if selected_numbers:
+                overlap = max(len(set(candidate["sorted"]) & set(existing)) for existing in selected_numbers)
+            
+            if overlap >= 5 and len(ranked_candidates) > sets:
+                continue
+                
+            final.append({
+                "sorted": candidate["sorted"],
+                "ordered": None,
+                "score": round(candidate["score_raw"] * 100, 4), # 가독성을 위해 100 곱함
+            })
+            selected_numbers.append(candidate["sorted"])
+            if len(final) >= sets:
+                break
+                
+        return final
+
+    def predict_probability_only(self, sets=5, simulation_count: int | None = None):
+        self._probability_mcmc_score_cache = {}
+        simulation_count = _sanitize_simulation_count(simulation_count) if simulation_count is not None else DEFAULT_SIMULATION_COUNT
+        simulation_profile = self._build_probability_direct_profile(simulation_count, sets=sets)
+        ranked_segments = self.giannella_segment_profiles.get("ranked_signatures", [])
+        segment_candidates = ranked_segments[: simulation_profile["segment_pool_size"]]
+        segment_weights = [max(item[1], 1e-6) for item in segment_candidates] if segment_candidates else []
+        best_by_key = {}
+
+        for _ in range(simulation_profile["candidate_iterations"]):
+            segment_signature = None
+            if segment_candidates:
+                segment_index = random.choices(range(len(segment_candidates)), weights=segment_weights, k=1)[0]
+                segment_signature = segment_candidates[segment_index][0]
+            seed_numbers, seed_score = self._sample_markov_giannella_ticket(segment_signature, simulation_profile)
+            refined_numbers, refined_score = self._repair_markov_giannella_ticket(
+                seed_numbers,
+                segment_signature,
+                simulation_profile,
+            )
+            key = tuple(sorted(refined_numbers))
+            giannella_score = self._giannella_pattern_score(key)
+            transition_score = self._probability_transition_score(key, simulation_profile, segment_signature)
+            total_score = (seed_score * 0.18) + (refined_score * 0.82)
+            current = best_by_key.get(key)
+            if current is None or total_score > current["score_raw"]:
+                best_by_key[key] = {
+                    "sorted": list(key),
+                    "score_raw": total_score,
+                    "segment_signature": segment_signature,
+                    "markov_score": transition_score,
+                    "giannella_score": giannella_score,
+                }
+
+        ranked_candidates = sorted(best_by_key.values(), key=lambda item: item["score_raw"], reverse=True)
+        final = []
+        selected_numbers = []
+        for candidate in ranked_candidates:
+            overlap = 0
+            if selected_numbers:
+                overlap = max(len(set(candidate["sorted"]) & set(existing_numbers)) for existing_numbers in selected_numbers)
+            if overlap >= 5 and len(ranked_candidates) > sets:
+                continue
+            final.append({
+                "sorted": candidate["sorted"],
+                "ordered": None,
+                "score": round(candidate["score_raw"], 4),
+            })
+            selected_numbers.append(candidate["sorted"])
+            if len(final) >= sets:
+                break
+
+        if len(final) < sets:
+            for candidate in ranked_candidates:
+                if any(candidate["sorted"] == existing["sorted"] for existing in final):
+                    continue
+                final.append({
+                    "sorted": candidate["sorted"],
+                    "ordered": None,
+                    "score": round(candidate["score_raw"], 4),
+                })
+                if len(final) >= sets:
+                    break
+
+        return final
+
+    def score_manual_combination(self, numbers):
+        input_numbers = [int(n) for n in numbers]
+        sorted_numbers = sorted(input_numbers)
+        # 성능 최적화: 6! = 720개 전체 순열 대신 전체 순열을 평가
+        # (6개 번호는 720개로 관리 가능한 수준이므로 전체 계산 유지)
+        permutation_scores = []
+        for perm in permutations(sorted_numbers):
+            ordered = list(perm)
+            score = sum(
+                math.log(max(self._number_weight(n, idx, ordered[:idx], False), 1e-12))
+                for idx, n in enumerate(ordered)
+            )
+            permutation_scores.append((score, ordered))
+
+        best_score, best_order = max(permutation_scores, key=lambda item: item[0])
+        average_score = sum(score for score, _ in permutation_scores) / len(permutation_scores)
+        input_order_score = sum(
+            math.log(max(self._number_weight(n, idx, input_numbers[:idx], False), 1e-12))
+            for idx, n in enumerate(input_numbers)
+        )
+        probability_score = sum(math.log(max(self._probability_only_weight(n), 1e-12)) for n in sorted_numbers)
+        return {
+            "input_order": input_numbers,
+            "sorted": sorted_numbers,
+            "best_order": best_order,
+            "best_score": round(best_score, 4),
+            "average_score": round(average_score, 4),
+            "input_order_score": round(input_order_score, 4),
+            "probability_score": round(probability_score, 4),
+        }
+
+
+def _init_session_state(project_dir: Path):
+    persisted = load_app_state(project_dir)
+    defaults = {
+        "auth": False,
+        "counts": dict(persisted.get("counts", {"prediction": 0, "probability": 0, "manual": 0})),
+        "unlock_mode": False,
+        "unlock_granted": bool(persisted.get("unlock_granted", False)),
+        "predict_results": None,
+        "probability_results": None,
+        "manual_result": None,
+        "analysis_summary": None,
+        "view": "",
+        "show_data_gate": False,
+        "data_access_granted": bool(persisted.get("data_access_granted", False)),
+        "history_selected_date": None,
+        "simulation_count": _sanitize_simulation_count(persisted.get("simulation_count", DEFAULT_SIMULATION_COUNT)),
+        "simulation_notice": None,
+        "analysis_signature": None,
+        "source_data_refresh_notice": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _persist_runtime_state(project_dir: Path):
+    save_app_state(
+        project_dir,
+        counts=st.session_state.get("counts", {}),
+        unlock_granted=st.session_state.get("unlock_granted", False),
+        data_access_granted=st.session_state.get("data_access_granted", False),
+        simulation_count=_sanitize_simulation_count(st.session_state.get("simulation_count", DEFAULT_SIMULATION_COUNT)),
+    )
+
+
+def _report_file_name(file_key: str, default_name: str | None = None) -> str | None:
+    file_name = REPORT_FILE_MAP.get(file_key)
+    if file_name:
+        return str(file_name)
+    return default_name
+
+
+def _report_file_path(report_dir: Path, file_key: str, default_name: str | None = None) -> Path | None:
+    file_name = _report_file_name(file_key, default_name)
+    if not file_name:
+        return None
+    return report_dir / file_name
+
+
+def _read_report_csv(report_dir: Path, file_key: str, default_name: str | None = None) -> pd.DataFrame:
+    file_path = _report_file_path(report_dir, file_key, default_name)
+    if file_path is None or not file_path.exists() or file_path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(file_path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _render_download_button(path: Path, label: str, mime: str, key: str):
+    if not path.exists():
+        return
+    with path.open("rb") as fp:
+        st.download_button(
+            label=label,
+            data=fp.read(),
+            file_name=path.name,
+            mime=mime,
+            key=key,
+            use_container_width=True,
+        )
+
+
+def _prize_order_from_label(value: object) -> int:
+    return {
+        "1등": 1,
+        "2등": 2,
+        "3등": 3,
+        "4등": 4,
+        "5등": 5,
+        "낙점": 6,
+    }.get(str(value).strip(), 99)
+
+
+
+def _arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """object 컬럼(예: 정수와 '-'가 섞인 후보순위)을 문자열로 통일해
+    Streamlit 의 Arrow 직렬화 경고(ArrowInvalid)를 제거한다."""
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].map(lambda v: "" if v is None else (v if isinstance(v, str) else str(v)))
+    return df
+
+
+def _sort_match_rows(display: pd.DataFrame) -> pd.DataFrame:
+    if display.empty:
+        return display
+
+    sortable = display.copy()
+    if "timestamp_kst" in sortable.columns and "timestamp_sort" not in sortable.columns:
+        sortable["timestamp_sort"] = pd.to_datetime(sortable["timestamp_kst"], errors="coerce")
+    elif "timestamp" in sortable.columns and "timestamp_sort" not in sortable.columns:
+        sortable["timestamp_sort"] = pd.to_datetime(sortable["timestamp"], utc=True, errors="coerce")
+
+    for col in ["target_round", "candidate_rank", "hit_count", "prize_order", "score", "score_metric"]:
+        if col in sortable.columns:
+            sortable[col] = pd.to_numeric(sortable[col], errors="coerce")
+
+    if "prize_order" not in sortable.columns and "prize_label" in sortable.columns:
+        sortable["prize_order"] = sortable["prize_label"].map(_prize_order_from_label)
+
+    sort_cols = []
+    ascending = []
+    for col, asc in [
+        ("target_round", False),
+        ("prize_order", True),
+        ("hit_count", False),
+        ("score", False),
+        ("score_metric", False),
+        ("candidate_rank", True),
+        ("timestamp_sort", False),
+    ]:
+        if col in sortable.columns:
+            sort_cols.append(col)
+            ascending.append(asc)
+
+    if sort_cols:
+        sortable = sortable.sort_values(sort_cols, ascending=ascending, na_position="last")
+    return sortable
+
+
+
+def _format_matched_report_df(matched_df: pd.DataFrame) -> pd.DataFrame:
+    if matched_df.empty:
+        return matched_df
+
+    display = _sort_match_rows(matched_df)
+
+    if "matched_numbers" in display.columns and "matched_numbers_text" not in display.columns:
+        def _match_text(nums) -> str:
+            if isinstance(nums, str):
+                try:
+                    nums = ast.literal_eval(nums)
+                except Exception:
+                    nums = []
+            if isinstance(nums, (list, tuple)) and nums:
+                return ", ".join(f"{int(n):02d}" for n in nums)
+            return "-"
+
+        display["matched_numbers_text"] = display["matched_numbers"].map(_match_text)
+
+    keep_cols = [
+        "timestamp",
+        "log_type",
+        "target_round",
+        "candidate_rank",
+        "numbers",
+        "actual_numbers",
+        "bonus_number",
+        "matched_numbers_text",
+        "hit_count",
+        "prize_label",
+        "score",
+        "avg_gap_factor",
+    ]
+    display = display[[c for c in keep_cols if c in display.columns]].copy()
+    display = _arrow_safe(display)
+    return display.rename(
+        columns={
+            "timestamp": "저장시각(UTC)",
+            "log_type": "로그유형",
+            "target_round": "대상회차",
+            "candidate_rank": "후보순위",
+            "numbers": "예측번호",
+            "actual_numbers": "실제당첨번호",
+            "bonus_number": "보너스번호",
+            "matched_numbers_text": "일치번호",
+            "hit_count": "적중개수",
+            "prize_label": "당첨결과",
+            "score": "점수",
+            "avg_gap_factor": "평균 gap 계수",
+        }
+    )
+
+
+
+def _format_selected_day_match_df(day_df: pd.DataFrame) -> pd.DataFrame:
+    if day_df.empty:
+        return pd.DataFrame()
+
+    display = day_df[day_df.get("log_type", pd.Series(index=day_df.index)).isin(["prediction", "probability"])].copy()
+    if display.empty:
+        return display
+
+    if "numbers_text" not in display.columns and "numbers" in display.columns:
+        display["numbers_text"] = display["numbers"].map(_format_number_sequence)
+    if "actual_numbers_text" not in display.columns and "actual_numbers" in display.columns:
+        display["actual_numbers_text"] = display["actual_numbers"].map(_format_number_sequence)
+    if "matched_numbers_text" not in display.columns and "matched_numbers" in display.columns:
+        display["matched_numbers_text"] = display["matched_numbers"].map(_format_number_sequence)
+    if "bonus_number" in display.columns:
+        bonus_series = pd.to_numeric(display["bonus_number"], errors="coerce")
+        display["bonus_number_text"] = bonus_series.map(lambda value: "-" if pd.isna(value) else f"{int(value):02d}")
+
+    has_actual = pd.Series(False, index=display.index)
+    if "actual_numbers_text" in display.columns:
+        actual_text = display["actual_numbers_text"].fillna("-").astype(str).str.strip()
+        has_actual = actual_text.ne("") & actual_text.ne("-")
+    elif "actual_numbers" in display.columns:
+        has_actual = display["actual_numbers"].map(lambda value: isinstance(value, (list, tuple)) and len(value) >= 6)
+    display = display[has_actual].copy()
+    if display.empty:
+        return display
+
+    display = _sort_match_rows(display)
+    keep_cols = [
+        "timestamp_kst",
+        "log_type",
+        "target_round",
+        "candidate_rank",
+        "numbers_text",
+        "actual_numbers_text",
+        "bonus_number_text",
+        "matched_numbers_text",
+        "hit_count",
+        "prize_label",
+        "score_metric",
+        "avg_gap_factor",
+    ]
+    display = display[[c for c in keep_cols if c in display.columns]].copy()
+    display = _arrow_safe(display)
+    return display.rename(
+        columns={
+            "timestamp_kst": "저장시각(KST)",
+            "log_type": "로그유형",
+            "target_round": "대상회차",
+            "candidate_rank": "후보순위",
+            "numbers_text": "예측번호",
+            "actual_numbers_text": "실제당첨번호",
+            "bonus_number_text": "보너스번호",
+            "matched_numbers_text": "일치번호",
+            "hit_count": "적중개수",
+            "prize_label": "당첨결과",
+            "score_metric": "대표점수",
+            "avg_gap_factor": "평균 gap 계수",
+        }
+    )
+
+
+
+def _render_selected_day_match_board(day_df: pd.DataFrame, selected_date_str: str, report_dir: Path) -> None:
+    st.markdown(f"##### {selected_date_str} 적중 매칭 · 확정 회차만 표시")
+
+    prediction_day_df = day_df[day_df.get("log_type", pd.Series(index=day_df.index)).isin(["prediction", "probability"])].copy()
+    latest_target_round = None
+    if not prediction_day_df.empty and "target_round" in prediction_day_df.columns:
+        target_round_series = pd.to_numeric(prediction_day_df["target_round"], errors="coerce").dropna()
+        if not target_round_series.empty:
+            latest_target_round = int(target_round_series.max())
+
+    matched_view = _format_selected_day_match_df(day_df)
+    latest_confirmed_round = None
+    if not matched_view.empty and "대상회차" in matched_view.columns:
+        confirmed_round_series = pd.to_numeric(matched_view["대상회차"], errors="coerce").dropna()
+        if not confirmed_round_series.empty:
+            latest_confirmed_round = int(confirmed_round_series.max())
+
+    if matched_view.empty:
+        if latest_target_round is not None:
+            st.info(f"선택한 날짜의 최신 예측 대상회차는 {latest_target_round}회차입니다. 다만 아직 실제 당첨번호가 확정되지 않아 이 표에는 표시되지 않습니다.")
+        else:
+            st.info("선택한 날짜의 예측 로그 중 아직 실제 당첨 결과와 연결된 항목이 없습니다.")
+        return
+
+    if latest_target_round is not None and latest_confirmed_round is not None and latest_target_round > latest_confirmed_round:
+        st.caption(
+            f"이 날짜의 최신 예측 대상회차는 {latest_target_round}회차입니다. 다만 아래 표와 CSV는 실제 당첨번호가 확정된 회차만 포함하므로 현재 {latest_confirmed_round}회차까지만 표시됩니다. 각 회차 안에서는 1등 → 낙점 순으로 정렬했습니다."
+        )
+    elif latest_confirmed_round is not None:
+        st.caption(
+            f"현재 이 날짜에 표시 가능한 최신 확정 대상회차는 {latest_confirmed_round}회차입니다. 아래 표와 CSV는 실제 당첨번호가 확정된 예측 로그만 포함하며, 각 회차 안에서는 1등 → 낙점 순으로 정렬했습니다."
+        )
+    else:
+        st.caption("실제 당첨번호가 확정된 예측 로그만 포함하며, 각 회차 안에서는 1등 → 낙점 순으로 정렬했습니다.")
+
+    st.dataframe(matched_view, use_container_width=True, hide_index=True)
+
+    report_file_path = _report_file_path(report_dir, "match", "prediction_actual_match.csv")
+    if report_file_path is not None:
+        _render_download_button(report_file_path, "적중 매칭 전체 CSV 다운로드", "text/csv", f"day_match_{selected_date_str}")
+
+
+@st.cache_data(show_spinner=False)
+def _load_actual_result_map(excel_path_str: str, cache_token: tuple[str, int, int]) -> dict[int, dict[str, object]]:
+    try:
+        df = _read_excel_cached(excel_path_str, cache_token).copy()
+    except Exception:
+        return {}
+
+    required_cols = ["회차", "번호1", "번호2", "번호3", "번호4", "번호5", "번호6"]
+    if df.empty or any(col not in df.columns for col in required_cols):
+        return {}
+
+    actual_map: dict[int, dict[str, object]] = {}
+    for row in df.to_dict(orient="records"):
+        try:
+            round_no = int(pd.to_numeric(row.get("회차"), errors="coerce"))
+        except Exception:
+            continue
+
+        numbers: list[int] = []
+        valid_numbers = True
+        for idx in range(1, 7):
+            try:
+                value = row.get(f"번호{idx}")
+                if pd.isna(value):
+                    valid_numbers = False
+                    break
+                numbers.append(int(value))
+            except Exception:
+                valid_numbers = False
+                break
+        if not valid_numbers:
+            continue
+
+        bonus_raw = row.get("보너스")
+        bonus_number = None
+        try:
+            if bonus_raw is not None and not pd.isna(bonus_raw):
+                bonus_number = int(bonus_raw)
+        except Exception:
+            bonus_number = None
+
+        actual_map[round_no] = {
+            "actual_numbers": sorted(numbers),
+            "bonus_number": bonus_number,
+            "draw_date": row.get("추첨일"),
+        }
+    return actual_map
+
+
+def _normalize_number_list(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+
+    loaded = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped == "-":
+            return []
+        try:
+            loaded = ast.literal_eval(stripped)
+        except Exception:
+            loaded = [part.strip() for part in stripped.split(",") if part.strip()]
+
+    if isinstance(loaded, tuple):
+        loaded = list(loaded)
+    if not isinstance(loaded, list):
+        return []
+
+    normalized: list[int] = []
+    for item in loaded:
+        try:
+            if item is None or (isinstance(item, float) and pd.isna(item)):
+                continue
+            normalized.append(int(item))
+        except Exception:
+            continue
+    return normalized
+
+
+def _prize_label_from_match(hit_count: int, bonus_match: bool) -> str:
+    hit_count = int(hit_count or 0)
+    if hit_count >= 6:
+        return "1등"
+    if hit_count == 5 and bonus_match:
+        return "2등"
+    if hit_count == 5:
+        return "3등"
+    if hit_count == 4:
+        return "4등"
+    if hit_count == 3:
+        return "5등"
+    return "낙점"
+
+
+def _enrich_logs_with_actual_results(
+    history_df: pd.DataFrame,
+    excel_path: Path,
+    cache_token: tuple[str, int, int],
+) -> pd.DataFrame:
+    if history_df.empty:
+        return history_df.copy()
+
+    actual_map = _load_actual_result_map(str(excel_path), cache_token)
+    display = history_df.copy()
+    if "actual_numbers" not in display.columns:
+        display["actual_numbers"] = [[] for _ in range(len(display))]
+    if "matched_numbers" not in display.columns:
+        display["matched_numbers"] = [[] for _ in range(len(display))]
+    display["actual_numbers_text"] = display.get("actual_numbers_text", pd.Series(index=display.index, dtype="object")).fillna("-")
+    display["matched_numbers_text"] = display.get("matched_numbers_text", pd.Series(index=display.index, dtype="object")).fillna("-")
+    display["bonus_number"] = display.get("bonus_number", pd.Series(index=display.index, dtype="object"))
+    display["bonus_match"] = display.get("bonus_match", pd.Series(False, index=display.index, dtype="bool"))
+    display["hit_count"] = pd.to_numeric(display.get("hit_count"), errors="coerce")
+    display["prize_label"] = display.get("prize_label", pd.Series(index=display.index, dtype="object")).fillna("-")
+    display["prize_order"] = pd.to_numeric(display.get("prize_order"), errors="coerce")
+
+    if not actual_map:
+        return display
+
+    # iterrows + 행별 .at 대입은 수만 행에서 수십 초가 걸린다(로그분석 진입 지연의 주범).
+    # 파이썬 리스트로 한 번에 순회하고 컬럼을 일괄 대입해 대폭 가속한다.
+    tr_list = pd.to_numeric(display.get("target_round"), errors="coerce").tolist()
+    nums_list = display["numbers"].tolist() if "numbers" in display.columns else [None] * len(display)
+    input_list = display["input_numbers"].tolist() if "input_numbers" in display.columns else [None] * len(display)
+
+    actual_numbers_out = list(display["actual_numbers"])
+    actual_text_out = list(display["actual_numbers_text"])
+    bonus_out = list(display["bonus_number"])
+    matched_out = list(display["matched_numbers"])
+    matched_text_out = list(display["matched_numbers_text"])
+    bonus_match_out = list(display["bonus_match"])
+    hit_out = list(display["hit_count"])
+    prize_label_out = list(display["prize_label"])
+    prize_order_out = list(display["prize_order"])
+
+    actual_cache: dict[int, tuple] = {}
+    for i in range(len(display)):
+        tr = tr_list[i]
+        if tr is None or pd.isna(tr):
+            continue
+        tr = int(tr)
+        actual_info = actual_map.get(tr)
+        if not actual_info:
+            continue
+        predicted_numbers = _normalize_number_list(nums_list[i]) or _normalize_number_list(input_list[i])
+        if not predicted_numbers:
+            continue
+        cached = actual_cache.get(tr)
+        if cached is None:
+            a_nums = [int(n) for n in actual_info.get("actual_numbers", [])]
+            cached = (a_nums, set(a_nums), actual_info.get("bonus_number"))
+            actual_cache[tr] = cached
+        actual_numbers, actual_set, bonus_number = cached
+        matched_numbers = sorted(set(predicted_numbers) & actual_set)
+        bonus_match = bool(bonus_number is not None and bonus_number in predicted_numbers)
+        hit_count = len(matched_numbers)
+
+        actual_numbers_out[i] = actual_numbers
+        actual_text_out[i] = _format_number_sequence(actual_numbers)
+        bonus_out[i] = bonus_number if bonus_number is not None else "-"
+        matched_out[i] = matched_numbers
+        matched_text_out[i] = _format_number_sequence(matched_numbers)
+        bonus_match_out[i] = bonus_match
+        hit_out[i] = hit_count
+        prize_label = _prize_label_from_match(hit_count, bonus_match)
+        prize_label_out[i] = prize_label
+        prize_order_out[i] = _prize_order_from_label(prize_label)
+
+    display["actual_numbers"] = actual_numbers_out
+    display["actual_numbers_text"] = actual_text_out
+    display["bonus_number"] = bonus_out
+    display["matched_numbers"] = matched_out
+    display["matched_numbers_text"] = matched_text_out
+    display["bonus_match"] = bonus_match_out
+    display["hit_count"] = hit_out
+    display["prize_label"] = prize_label_out
+    display["prize_order"] = prize_order_out
+    return display
+
+
+def _artifact_label(key: str) -> str:
+    return ARTIFACT_LABEL_MAP.get(str(key), str(key))
+
+
+def _history_display_df(history_df: pd.DataFrame, limit: int | None = None) -> pd.DataFrame:
+    if history_df.empty:
+        return history_df
+    display = _sort_match_rows(history_df.copy())
+    # 표에 보일 만큼만 남기고 무거운 포맷(.map)을 적용 → 수천 행 전체 포맷 비용 제거
+    if limit is not None and limit > 0 and len(display) > limit:
+        display = display.head(limit).copy()
+    if "log_type" in display.columns:
+        display["log_type"] = display["log_type"].map(_log_type_label)
+    if "actual_numbers_text" not in display.columns and "actual_numbers" in display.columns:
+        display["actual_numbers_text"] = display["actual_numbers"].map(_format_number_sequence)
+    if "matched_numbers_text" not in display.columns and "matched_numbers" in display.columns:
+        display["matched_numbers_text"] = display["matched_numbers"].map(_format_number_sequence)
+    if "bonus_number" in display.columns:
+        bonus_series = pd.to_numeric(display["bonus_number"], errors="coerce")
+        display["bonus_number_text"] = bonus_series.map(lambda value: "-" if pd.isna(value) else f"{int(value):02d}")
+    if "hit_count" in display.columns:
+        hit_series = pd.to_numeric(display["hit_count"], errors="coerce")
+        display["hit_count_text"] = hit_series.map(lambda value: "-" if pd.isna(value) else int(value))
+    keep_cols = [
+        "log_type",
+        "timestamp_kst",
+        "date_kst",
+        "week_kst",
+        "month_kst",
+        "target_round",
+        "candidate_rank",
+        "numbers_text",
+        "actual_numbers_text",
+        "bonus_number_text",
+        "matched_numbers_text",
+        "hit_count_text",
+        "prize_label",
+        "score_metric",
+        "avg_gap_factor",
+        "avg_probability_weight",
+        "run_id",
+    ]
+    display = display[[c for c in keep_cols if c in display.columns]].copy()
+    rename_map = {
+        "log_type": "로그유형",
+        "timestamp_kst": "저장시각(KST)",
+        "date_kst": "일자",
+        "week_kst": "주간",
+        "month_kst": "월간",
+        "target_round": "대상회차",
+        "candidate_rank": "후보순위",
+        "numbers_text": "번호조합",
+        "actual_numbers_text": "실제당첨번호",
+        "bonus_number_text": "보너스번호",
+        "matched_numbers_text": "일치번호",
+        "hit_count_text": "적중개수",
+        "prize_label": "당첨결과",
+        "score_metric": "대표점수",
+        "avg_gap_factor": "평균 gap 계수",
+        "avg_probability_weight": "평균 확률 가중치",
+        "run_id": "run_id",
+    }
+    return _arrow_safe(display.rename(columns=rename_map))
+
+
+def _usage_status_snapshot() -> tuple[str, str, str, str]:
+    unlock_granted = bool(st.session_state.get("unlock_granted"))
+    if unlock_granted:
+        return "무제한 모드", "무제한", "무제한", "사용 제한 해제가 유지 중입니다."
+
+    counts = st.session_state.get("counts", {})
+    prediction_remaining = str(_remaining_uses(counts.get("prediction", 0)))
+    probability_remaining = str(_remaining_uses(counts.get("probability", 0)))
+    return (
+        "제한 모드",
+        f"{prediction_remaining}/{LOCK_LIMIT}",
+        f"{probability_remaining}/{LOCK_LIMIT}",
+        "패턴 추천과 확률 추천은 각각 최대 3회까지 사용할 수 있습니다.",
+    )
+
+
+def _render_hero(predictor: LottoPredictor):
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <div class="hero-eyebrow">DAINTELLIGENCE</div>
+            <h1 class="hero-title">{TITLE}</h1>
+            <p class="hero-subtitle">{SUBTITLE}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_feature_card(theme: str, eyebrow: str, title: str, desc: str):
+    st.markdown(
+        f"""
+        <div class="feature-card {theme}">
+            <div class="eyebrow">{eyebrow}</div>
+            <div class="title">{title}</div>
+            <div class="desc">{desc}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_home_guide_studio() -> None:
+    mode_label, prediction_remaining, probability_remaining, limit_desc = _usage_status_snapshot()
+    st.markdown(
+        f"""
+        <div class="guide-studio-shell">
+            <div class="guide-grid">
+                <div class="guide-card-premium guide-card-cyan">
+                    <div class="card-label">How To Use</div>
+                    <h4>이렇게 쓰세요</h4>
+                    <p>버튼만 누르면 추천 번호가 바로 나옵니다.</p>
+                    <ol class="guide-step-list">
+                        <li><b>패턴 추천 받기</b> — 처음이라면 여기부터. 자주 나온 번호 + 한동안 안 나온 번호를 함께 따져 뽑습니다.</li>
+                        <li><b>확률 추천 받기</b> — 다른 방식으로 한 번 더. 직전 회차에서 이어질 흐름을 계산해 뽑습니다.</li>
+                        <li><b>내 번호 확인</b> — 6개 입력 후 <code>점수 계산하기</code>로 채점, 고르기 귀찮으면 <code>나혼자 당첨</code>이 균형 잡힌 번호를 자동 생성.</li>
+                        <li><b>AI 추천 (화면 아래)</b> — 위에서 받은 추천들이 쌓일수록 똑똑해지는 자동 추천 TOP5. 버튼 없이 매일 자동으로 갱신됩니다.</li>
+                    </ol>
+                </div>
+                <div class="guide-card-premium guide-card-violet">
+                    <div class="card-label">Formula &amp; Reading</div>
+                    <h4>안에 들어있는 공식</h4>
+                    <p>각 추천에 실제로 들어가는 계산입니다.</p>
+                    <ul class="guide-step-list">
+                        <li><b>패턴 추천</b> : <code>F×G×P</code> (빈도·미출현·pair) → 합계·홀짝·구간 적합도로 재정렬.</li>
+                        <li><b>확률 추천</b> : 마르코프 전이확률 + 지아넬라 패턴 + 시뮬레이션 규모.</li>
+                        <li><b>AI 추천</b> : <code>통계 60% + 로그 40%</code> 종합점수
+                            <ul>
+                                <li>통계 : gap·동반출현·합계·끝자리·구간·마르코프·빈도</li>
+                                <li>로그 : 최신 기록 가중(반감기 2일) + 중복 패널티</li>
+                            </ul>
+                        </li>
+                    </ul>
+                </div>
+                <div class="guide-card-premium guide-card-emerald">
+                    <div class="card-label">Workspace</div>
+                    <h4>사용 제한 · 작업 상태</h4>
+                    <p>현재 홈 화면에서 확인할 수 있는 사용 제한 결과 값을 바로 볼 수 있습니다.</p>
+                    <ul class="guide-step-list">
+                        <li><b>현재 운영 모드</b> : {mode_label}</li>
+                        <li><b>패턴 추천 남은 횟수</b> : {prediction_remaining}</li>
+                        <li><b>확률 추천 남은 횟수</b> : {probability_remaining}</li>
+                        <li><b>상태 안내</b> : {limit_desc}</li>
+                    </ul>
+                    <div class="guide-note">데이터 인벤토리 logs를 <b>축적·분석</b>하도록 설계 했습니다.</div>
+                </div>
+            </div>
+            <div class="guide-readband">
+                <div class="guide-readband-title">숫자 읽는 법</div>
+                <div class="guide-readband-items">
+                    <div class="guide-readband-item"><code>gap 계수</code><span>그 번호가 최근 얼마나 오래 안 나왔는지.</span></div>
+                    <div class="guide-readband-item"><code>확률 가중치</code><span>번호 하나하나의 기본 힘.</span></div>
+                    <div class="guide-readband-item"><code>확률 점수</code><span>6개를 합쳤을 때 조합 전체의 우선순위.</span></div>
+                </div>
+                <div class="guide-readband-tip">숫자 자체보다 <b>여러 번 뽑아 비교</b>하는 게 핵심입니다.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _lotto_ball_color(n: int) -> str:
+    """로또 공 실제 색상 규칙."""
+    if n <= 10:
+        return "#B8860B"  # 1-10
+    if n <= 20:
+        return "#1565C0"  # 11-20
+    if n <= 30:
+        return "#C62828"  # 21-30
+    if n <= 40:
+        return "#546E7A"  # 31-40
+    return "#2E7D32"      # 41-45
+
+
+def _lotto_balls_html(nums) -> str:
+    """번호 리스트를 실제 공 색상의 동그란 배지 HTML로 변환."""
+    if not nums:
+        return "-"
+    spans = []
+    for n in nums:
+        try:
+            iv = int(n)
+        except Exception:
+            continue
+        color = _lotto_ball_color(iv)
+        spans.append(
+            "<span style=\"display:inline-flex;align-items:center;justify-content:center;"
+            "width:30px;height:30px;border-radius:50%;background:#F4F1EA;border:1px solid rgba(28,25,20,0.14);color:{c};"
+            "font-weight:700;font-size:13px;line-height:1;margin:2px 3px;"
+            "box-shadow:0 1px 3px rgba(28,25,20,0.10);\">{v:02d}</span>".format(c=color, v=iv)
+        )
+    return "<span style=\"display:inline-flex;flex-wrap:wrap;align-items:center;\">" + "".join(spans) + "</span>"
+
+
+def _render_metric_panel(container, label: str, value: str, desc: str):
+    container.markdown(
+        f"""
+        <div class="metric-panel">
+            <div class="label">{label}</div>
+            <div class="value">{value}</div>
+            <div class="desc">{desc}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_stats_grid(container, items: list[tuple[str, str, str]]):
+    if not items:
+        return
+    row_size = 3 if len(items) > 2 else len(items)
+    for start in range(0, len(items), row_size):
+        chunk = items[start : start + row_size]
+        cols = container.columns(len(chunk))
+        for col, (label, value, desc) in zip(cols, chunk):
+            _render_metric_panel(col, label, value, desc)
+
+
+def _build_analysis_context_items(
+    predictor: "LottoPredictor",
+    latest_source_round: int | None = None,
+) -> list[tuple[str, str, str]]:
+    analyzed_round = int(latest_source_round) if latest_source_round is not None else int(predictor.total_draws)
+    return [
+        ("분석 회차", f"{analyzed_round:,}", "현재 불러온 최신 원본 회차 기준입니다."),
+        ("평균 인접 중복", f"{predictor.adjacent_overlap_stats['average']:.3f}", "연속 회차 사이 번호 겹침 정도입니다."),
+        ("시뮬레이션 규모", f"{_current_simulation_count():,}", "추천 계산에 사용하는 반복 횟수입니다."),
+    ]
+
+
+def _build_home_overview_items(predictor: "LottoPredictor", latest_source_round: int | None = None) -> list[tuple[str, str, str]]:
+    prediction_remaining = "∞" if st.session_state.get("unlock_granted") else str(_remaining_uses(st.session_state.get("counts", {}).get("prediction", 0)))
+    probability_remaining = "∞" if st.session_state.get("unlock_granted") else str(_remaining_uses(st.session_state.get("counts", {}).get("probability", 0)))
+    mode_label = "무제한" if st.session_state.get("unlock_granted") else "제한 모드"
+    return _build_analysis_context_items(predictor, latest_source_round) + [
+        ("패턴 추천 사용 가능", prediction_remaining, "현재 세션에서 바로 실행 가능한 패턴 추천 상태입니다."),
+        ("확률 추천 사용 가능", probability_remaining, "출현 확률 추천에서 즉시 사용할 수 있는 상태입니다."),
+        ("현재 운영 모드", mode_label, "잠금 상태와 추천 사용 정책을 한눈에 보여줍니다."),
+    ]
+
+
+def _render_home_dashboard(predictor: "LottoPredictor") -> None:
+    return
+
+
+def _get_stage_separator_copy(view: str) -> tuple[str, str, str] | None:
+    return None
+
+
+def _render_stage_separator(container, view: str) -> None:
+    copy = _get_stage_separator_copy(view)
+    if not copy:
+        return
+    eyebrow, title, desc = copy
+    container.markdown(
+        f"""
+        <div class="stage-card-bridge">
+            <div class="header-title">{eyebrow}</div>
+            <div class="title">{title}</div>
+            <div class="desc">{desc}</div>
+            <div class="meta">핵심 수치 확인 → 추천 카드 또는 로그 데이터 해석 순서로 이어지도록 화면 흐름을 다시 정리했습니다.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _format_ball_badges(numbers: list[int]) -> str:
+    return "".join(f'<span class="number-ball" style="color:{_get_ball_color_hex(int(n))} !important;">{int(n):02d}</span>' for n in numbers)
+
+
+def _render_number_detail_cards(container, predictor: LottoPredictor, numbers: list[int]) -> None:
+    if not numbers:
+        return
+    for start in range(0, len(numbers), 3):
+        chunk = numbers[start : start + 3]
+        cols = container.columns(len(chunk))
+        for col, n in zip(cols, chunk):
+            gap = predictor.last_seen_gap[n]
+            gap_factor = predictor._current_gap_factor(n)
+            prob_weight = predictor._probability_only_weight(n)
+            status = "최신 회차 출현" if gap == 0 else f"최근 {gap}회 미출현"
+            panel = col.container()
+            panel.markdown(f"**번호 {n:02d}**")
+            panel.caption(f"전체 출현 {predictor.total_counter[n]}회")
+            panel.caption(f"현재 상태 {status}")
+            panel.caption(f"gap 계수 {gap_factor:.4f}")
+            panel.caption(f"확률 가중치 {prob_weight:.4f}")
+
+
+def _render_result_block(container, title: str, intro: str, results: list[dict], predictor: LottoPredictor, probability_only: bool = False):
+    if title:
+        container.markdown(f"### {title}")
+    if intro:
+        container.caption(intro)
+    for i, item in enumerate(results, 1):
+        numbers = item["sorted"]
+        ordered = item.get("ordered")
+        label = "확률 후보" if probability_only else "후보"
+        ordered_text = _format_number_sequence(ordered) if ordered else "-"
+        container.markdown(
+            f"""
+            <div class="result-card">
+                <h4>{label} {i:02d} · 점수 {item['score']}</h4>
+                <div class="number-badges">{_format_ball_badges(numbers)}</div>
+                <p><b>추천 순서</b> : {ordered_text}</p>
+                <p><b>평균 gap 계수</b> : {predictor.average_gap_factor(numbers):.6f}</p>
+                <p><b>평균 확률 가중치</b> : {predictor.average_probability_weight(numbers):.6f}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        _render_number_detail_cards(container, predictor, numbers)
+        container.markdown("<div class='divider-space'></div>", unsafe_allow_html=True)
+
+
+KOREAN_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+LOG_TYPE_LABELS = {
+    "prediction": "패턴 분석",
+    "probability": "확률 분석",
+    "manual": "수동 점수",
+    "analysis": "분석 요약",
+}
+PERIOD_LABELS = {
+    "date_kst": "일자",
+    "week_kst": "주간",
+    "month_kst": "월간",
+}
+
+
+def _log_type_label(value: str) -> str:
+    return LOG_TYPE_LABELS.get(str(value), str(value))
+
+
+def _format_number_sequence(numbers) -> str:
+    if not numbers:
+        return "-"
+    try:
+        return ", ".join(f"{int(n):02d}" for n in numbers)
+    except Exception:
+        return str(numbers)
+
+
+def _format_period_summary_df(summary_df: pd.DataFrame, period_col: str) -> pd.DataFrame:
+    if summary_df.empty:
+        return summary_df
+    display = summary_df.copy()
+    if "log_type" in display.columns:
+        display["log_type"] = display["log_type"].map(_log_type_label)
+    rename_map = {
+        period_col: PERIOD_LABELS.get(period_col, period_col),
+        "log_type": "로그유형",
+        "logs": "저장건수",
+        "unique_runs": "실행수",
+        "unique_target_rounds": "대상회차수",
+        "scored_logs": "점수보유건수",
+        "score_coverage": "점수보유율",
+        "avg_score": "평균 대표점수",
+        "median_score": "중앙값 점수",
+        "score_std": "점수 표준편차",
+        "best_score": "최고 대표점수",
+        "p25_score": "점수 25%",
+        "p75_score": "점수 75%",
+        "avg_gap_factor": "평균 gap 계수",
+        "avg_probability_weight": "평균 확률 가중치",
+    }
+    return display.rename(columns=rename_map)
+
+
+def _format_log_type_summary_df(summary_df: pd.DataFrame) -> pd.DataFrame:
+    if summary_df.empty:
+        return summary_df
+    display = summary_df.copy()
+    if "log_type" in display.columns:
+        display["log_type"] = display["log_type"].map(_log_type_label)
+    rename_map = {
+        "log_type": "로그유형",
+        "logs": "저장건수",
+        "unique_runs": "실행수",
+        "unique_target_rounds": "대상회차수",
+        "scored_logs": "점수보유건수",
+        "score_coverage": "점수보유율",
+        "avg_score": "평균 대표점수",
+        "median_score": "중앙값 점수",
+        "score_std": "점수 표준편차",
+        "best_score": "최고 대표점수",
+        "p25_score": "점수 25%",
+        "p75_score": "점수 75%",
+        "avg_gap_factor": "평균 gap 계수",
+        "avg_probability_weight": "평균 확률 가중치",
+    }
+    return display.rename(columns=rename_map)
+
+
+def _render_analysis_summary_detail(summary: dict) -> None:
+    summary = dict(summary or {})
+    threshold = summary.get("recommended_threshold") or {}
+    _render_stats_grid(
+        st,
+        [
+            ("매칭 로그", f"{int(summary.get('resolved_match_rows', 0) or 0):,}", "실제 당첨 번호와 비교 가능한 로그 수입니다."),
+            ("시계열 행", f"{int(summary.get('time_series_rows', 0) or 0):,}", "날짜별 추이 분석에 반영된 집계 행 수입니다."),
+            ("추천 임계값", str(threshold.get("threshold", "-")), "3개 이상 적중 비율을 계산할 때 추천된 기준 점수입니다."),
+            ("실행 ID", str(summary.get("run_id") or "-"), "이번 분석 실행을 구분하는 식별값입니다."),
+        ],
+    )
+
+    if threshold:
+        st.markdown(
+            f"""
+            <div class="soft-panel">
+                <h4>추천 임계값 상세</h4>
+                <p>기준 점수 <b>{threshold.get('threshold', '-')}</b><br>
+                샘플 수 <b>{threshold.get('samples', '-')}</b><br>
+                3개 이상 적중 비율 <b>{threshold.get('hit_3_plus_rate', 0):.2%}</b></p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("현재는 추천 임계값을 계산할 만큼 실제 매칭 로그가 충분하지 않습니다.")
+
+    artifacts = summary.get("artifacts") or {}
+    if isinstance(artifacts, dict) and artifacts:
+        artifact_df = pd.DataFrame(
+            [
+                {"산출물": _artifact_label(key), "파일명": value}
+                for key, value in artifacts.items()
+            ]
+        )
+        st.markdown("##### 산출물 파일")
+        st.dataframe(artifact_df, use_container_width=True, hide_index=True)
+
+
+def _render_period_kpis(logs_df: pd.DataFrame, prefix: str):
+    score_series = pd.to_numeric(logs_df.get("score_metric"), errors="coerce") if not logs_df.empty else pd.Series(dtype=float)
+    scored = score_series.dropna()
+    avg_score = scored.mean() if not scored.empty else float("nan")
+    best_score = scored.max() if not scored.empty else float("nan")
+    score_std = scored.std(ddof=0) if not scored.empty else float("nan")
+    type_count = int(logs_df["log_type"].nunique()) if (not logs_df.empty and "log_type" in logs_df.columns) else 0
+    unique_runs = int(logs_df["run_id"].replace("-", pd.NA).dropna().nunique()) if (not logs_df.empty and "run_id" in logs_df.columns) else 0
+    score_coverage = (len(scored) / len(logs_df)) if len(logs_df) else 0.0
+
+    _render_stats_grid(
+        st,
+        [
+            (f"{prefix} 로그", f"{len(logs_df):,}", "선택한 범위에 저장된 로그 수입니다."),
+            (f"{prefix} 실행수", f"{unique_runs:,}", "동일 run_id를 묶은 실제 분석 실행 횟수입니다."),
+            (f"{prefix} 로그 유형", f"{type_count:,}", "해당 기간에 기록된 로그 유형 수입니다."),
+            (f"{prefix} 점수보유율", f"{score_coverage:.1%}", "대표 점수를 가진 로그 비율입니다."),
+            (f"{prefix} 평균 점수", f"{avg_score:.4f}" if pd.notna(avg_score) else "-", "대표 점수의 평균값입니다."),
+            (f"{prefix} 점수 표준편차", f"{score_std:.4f}" if pd.notna(score_std) else "-", "점수 분산이 큰지 빠르게 확인하는 지표입니다."),
+            (f"{prefix} 최고 점수", f"{best_score:.4f}" if pd.notna(best_score) else "-", "대표 점수 기준 최고값입니다."),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _log_full_csv_cached(key_prefix: str, token: tuple, _logs_df: pd.DataFrame) -> bytes:
+    """전체 로그 CSV는 매 rerun 마다 만들면 느리므로 token(파일상태) 기준으로 캐시한다.
+    _logs_df 는 언더스코어라 해시 대상에서 제외(같은 캐시 df 재사용)."""
+    if _logs_df is None or _logs_df.empty:
+        return b""
+    full_display = _history_display_df(_logs_df)
+    return full_display.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+@st.cache_data(show_spinner=False)
+def _recommend_freq_df(token: tuple, _history_df: pd.DataFrame) -> pd.DataFrame:
+    """추천 로그 전체의 번호 빈도표. token(파일상태) 기준 캐시 → 매 rerun 재계산 방지."""
+    from collections import Counter as _C
+    import json as _j
+    c = _C()
+    if _history_df is not None and not _history_df.empty and "numbers_json" in _history_df.columns:
+        for cell in _history_df["numbers_json"]:
+            if isinstance(cell, (list, tuple)):
+                seq = cell
+            elif isinstance(cell, str) and cell.strip():
+                try:
+                    seq = _j.loads(cell)
+                except Exception:
+                    seq = []
+            else:
+                seq = []
+            if isinstance(seq, (list, tuple)):
+                for n in seq:
+                    try:
+                        iv = int(n)
+                    except Exception:
+                        continue
+                    if 1 <= iv <= 45:
+                        c[iv] += 1
+    if not c:
+        return pd.DataFrame(columns=["번호", "추천 횟수", "비중(%)"])
+    total = sum(c.values())
+    return pd.DataFrame(
+        [{"번호": f"{n:02d}", "추천 횟수": v, "비중(%)": round(v / total * 100, 2)} for n, v in c.items()]
+    ).sort_values("추천 횟수", ascending=False).reset_index(drop=True)
+
+
+def _render_log_detail_table(logs_df: pd.DataFrame, title: str, key_prefix: str, preview_limit: int | None = None, csv_token: tuple | None = None) -> None:
+    st.markdown(f"##### {title}")
+    if logs_df.empty:
+        st.info("표시할 로그가 없습니다.")
+        return
+
+    total_rows = int(len(logs_df))
+    sort_note = "당첨결과가 있는 항목은 같은 회차 안에서 1등 → 낙점 순으로 정렬합니다."
+    # 표에 보일 만큼만 포맷한다(상위 N행). 수천 행 전체를 매번 포맷하던 비용 제거.
+    visible_df = _history_display_df(logs_df, limit=preview_limit)
+    if preview_limit is not None and preview_limit > 0 and total_rows > preview_limit:
+        st.caption(
+            f"화면에는 최근 {preview_limit:,}건을 표시합니다. 전체 보관 로그 수: {total_rows:,}건 · {sort_note} 다운로드 버튼으로 전체 로그를 받을 수 있습니다."
+        )
+    else:
+        st.caption(f"전체 보관 로그 {total_rows:,}건을 화면에 표시합니다. {sort_note} 필요하면 아래 다운로드 버튼으로 전체 CSV도 받을 수 있습니다.")
+    st.dataframe(visible_df, use_container_width=True, hide_index=True)
+
+    # 전체 CSV는 캐시(토큰 동일 시 재계산 안 함). 토큰이 없으면 즉석 생성(드문 경로).
+    if csv_token is not None:
+        csv_data = _log_full_csv_cached(key_prefix, csv_token, logs_df)
+    else:
+        csv_data = _history_display_df(logs_df).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        f"{title} 전체 CSV 다운로드",
+        data=csv_data,
+        file_name=f"{key_prefix}_full_history.csv",
+        mime="text/csv",
+        key=f"download_{key_prefix}_full_history",
+        use_container_width=True,
+    )
+
+
+def _remaining_uses(count: int) -> int:
+    return max(LOCK_LIMIT - int(count or 0), 0)
+
+
+def _render_home_status_strip() -> None:
+    prediction_remaining = _remaining_uses(st.session_state.counts.get("prediction", 0))
+    probability_remaining = _remaining_uses(st.session_state.counts.get("probability", 0))
+
+    if st.session_state.unlock_granted:
+        tone = "unlocked"
+        badge = "무제한 유지"
+        title = "사용 제한 해제가 유지 중입니다"
+        desc = "패턴 추천과 확률 추천을 계속 이용할 수 있습니다. 원하는 방식으로 바로 결과 화면으로 이동해 비교해 보세요."
+        meta = "두 추천 버튼 모두 즉시 실행 가능합니다. 로그 분석 · 히스토리와 함께 흐름을 이어서 확인하면 좋습니다."
+    else:
+        tone = "limited"
+        badge = "제한 모드"
+        title = "현재는 제한 모드입니다"
+        desc = "패턴 추천과 확률 추천은 각각 최대 3회까지 사용할 수 있습니다. 분석 스튜디오 아래에서 남은 사용 가능 횟수를 바로 확인할 수 있습니다."
+        meta = f"패턴 남은 횟수 {prediction_remaining}/{LOCK_LIMIT} · 확률 남은 횟수 {probability_remaining}/{LOCK_LIMIT}"
+
+    st.markdown(
+        f"""
+        <div class="status-strip {tone}">
+            <div class="badge">{badge}</div>
+            <div class="body">
+                <div class="title">{title}</div>
+                <div class="desc">{desc}</div>
+                <div class="meta">{meta}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _shift_month(base_date: date, month_offset: int) -> date:
+    total_month = (base_date.year * 12 + (base_date.month - 1)) + month_offset
+    year = total_month // 12
+    month = total_month % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(base_date.day, last_day))
+
+
+def _coerce_date_value(value, fallback: date) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _sync_history_selected_date_from_picker():
+    picker_value = st.session_state.get("history_selected_date_picker")
+    if picker_value is None:
+        return
+    st.session_state.history_selected_date = _coerce_date_value(picker_value, st.session_state.get("history_selected_date"))
+
+
+def _set_log_filter_mode(mode_key: str, mode: str) -> None:
+    st.session_state[mode_key] = mode
+
+
+def _resolve_target_round_week_window(target_round: int) -> tuple[date, date] | None:
+    # lotto.xlsx 는 소스 디렉터리에 있으므로 _project_root 사용
+    excel_path = _project_root / "lotto.xlsx"
+    if not excel_path.exists():
+        # fallback: 데이터 디렉터리 복사본
+        excel_path = _resolve_data_dir() / "lotto.xlsx"
+    if not excel_path.exists():
+        return None
+
+    cache_token = _file_cache_token(excel_path)
+    try:
+        schedule_df = _read_excel_cached(str(excel_path), cache_token)[["회차", "추첨일"]].copy()
+    except Exception:
+        return None
+
+    if schedule_df.empty:
+        return None
+
+    schedule_df["회차"] = pd.to_numeric(schedule_df["회차"], errors="coerce")
+    schedule_df["추첨일"] = pd.to_datetime(schedule_df["추첨일"], errors="coerce")
+    schedule_df = schedule_df.dropna(subset=["회차", "추첨일"])
+    if schedule_df.empty:
+        return None
+
+    round_to_draw_date = {
+        int(row["회차"]): row["추첨일"].date()
+        for _, row in schedule_df.iterrows()
+    }
+    if not round_to_draw_date:
+        return None
+
+    min_round = min(round_to_draw_date)
+    max_round = max(round_to_draw_date)
+
+    if target_round in round_to_draw_date:
+        end_date = round_to_draw_date[target_round]
+    elif target_round > max_round:
+        end_date = round_to_draw_date[max_round] + timedelta(days=7 * (target_round - max_round))
+    elif target_round < min_round:
+        end_date = round_to_draw_date[min_round] - timedelta(days=7 * (min_round - target_round))
+    else:
+        return None
+
+    start_date = end_date - timedelta(days=6)
+    return start_date, end_date
+
+
+def _set_round_week_filter(
+    target_round: int,
+    week_label: str,
+    start_key: str,
+    end_key: str,
+    mode_key: str,
+    selected_round_key: str,
+    selected_label_key: str,
+) -> None:
+    window = _resolve_target_round_week_window(int(target_round))
+    if window is not None:
+        start_date, end_date = window
+        st.session_state[start_key] = start_date
+        st.session_state[end_key] = end_date
+        st.session_state[f"{start_key}_picker"] = start_date
+        st.session_state[f"{end_key}_picker"] = end_date
+
+    st.session_state[mode_key] = "round_week"
+    st.session_state[selected_round_key] = int(target_round)
+    st.session_state[selected_label_key] = week_label
+
+
+def _reset_log_date_filter(start_key: str, end_key: str, min_date: date, max_date: date, mode_key: str | None = None) -> None:
+    st.session_state[start_key] = min_date
+    st.session_state[end_key] = max_date
+    st.session_state[f"{start_key}_picker"] = min_date
+    st.session_state[f"{end_key}_picker"] = max_date
+    if mode_key:
+        st.session_state[mode_key] = "all"
+
+
+@st.cache_data(show_spinner=False)
+def _prepare_history_analytics(_history_df: pd.DataFrame, token: tuple) -> pd.DataFrame:
+    """로그 enrich(날짜 파생·수치화)는 비용이 크므로 token(파일상태) 기준으로 캐시한다.
+    token 이 같으면 캘린더 클릭·탭 전환 같은 잦은 rerun 에서 재계산하지 않는다.
+    _history_df 는 언더스코어 접두사라 해시 대상에서 제외된다(같은 캐시 df 객체 재사용)."""
+    return enrich_history_dataframe(_history_df)
+
+
+def _build_period_summary(history_df: pd.DataFrame, period_col: str) -> pd.DataFrame:
+    return build_history_period_summary(history_df, period_col)
+
+
+def _build_log_type_summary(history_df: pd.DataFrame) -> pd.DataFrame:
+    return build_history_log_type_summary(history_df)
+
+
+def _render_clickable_calendar(history_df: pd.DataFrame, selected_date: date) -> None:
+    selected_month = selected_date.strftime("%Y-%m")
+    month_df = history_df[history_df["month_kst"] == selected_month].copy()
+
+    st.markdown(
+        f"""
+        <div class="calendar-panel">
+            <div class="title">{selected_month} 로그 캘린더</div>
+            <div class="desc">원하는 날짜를 직접 눌러서 즉시 로그를 확인할 수 있습니다.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if month_df.empty:
+        st.info("선택한 달에는 저장된 로그가 없습니다.")
+        return
+
+    year, month = [int(part) for part in selected_month.split("-")]
+    day_counts = month_df.groupby("date_kst").size().to_dict()
+    type_labels = (
+        month_df.groupby("date_kst")["log_type"]
+        .agg(lambda values: ", ".join(sorted({_log_type_label(v) for v in values})))
+        .to_dict()
+    )
+
+    header_cols = st.columns(7)
+    for idx, name in enumerate(["일", "월", "화", "수", "목", "금", "토"]):
+        header_cols[idx].markdown(f"<div class='calendar-head'>{name}</div>", unsafe_allow_html=True)
+
+    cal = calendar.Calendar(firstweekday=6)
+    for week in cal.monthdayscalendar(year, month):
+        cols = st.columns(7)
+        for idx, day_value in enumerate(week):
+            with cols[idx]:
+                if day_value == 0:
+                    st.markdown("<div class='calendar-cell empty'></div>", unsafe_allow_html=True)
+                    continue
+                day_obj = date(year, month, day_value)
+                day_key = day_obj.strftime("%Y-%m-%d")
+                count = int(day_counts.get(day_key, 0))
+                types = type_labels.get(day_key, "로그 없음")
+                button_type = "primary" if day_obj == selected_date else "secondary"
+                if st.button(f"{day_value}", key=f"history_calendar_{day_key}", use_container_width=True, type=button_type):
+                    st.session_state.history_selected_date = day_obj
+                    st.rerun(scope="fragment")
+                st.caption(f"{count}건")
+                st.caption(types)
+
+
+@st.fragment
+def _render_calendar_history_section(analytics_df: pd.DataFrame, report_dir: Path):
+    if analytics_df.empty:
+        st.info("표시할 로그 히스토리가 없습니다.")
+        return
+
+    available_dates = [d for d in analytics_df["date_obj"].dropna().drop_duplicates().tolist() if d is not None]
+    if not available_dates:
+        st.info("날짜 정보가 있는 로그가 아직 없습니다.")
+        return
+
+    available_dates = sorted(available_dates)
+    # 캘린더 기본값을 항상 오늘 날짜로 설정 (사용자 요청)
+    today_date = datetime.now(KST).date()
+    latest_date = available_dates[-1]
+    min_date = available_dates[0]
+    max_date = available_dates[-1]
+    
+    # 오늘 날짜가 데이터 범위 내에 있으면 오늘을, 아니면 가장 최근 데이터를 기본값으로 사용
+    default_date = today_date if min_date <= today_date <= max_date else latest_date
+    current_selected = _coerce_date_value(st.session_state.get("history_selected_date"), default_date)
+    if current_selected < min_date:
+        current_selected = min_date
+    if current_selected > max_date:
+        current_selected = max_date
+    st.session_state.history_selected_date = current_selected
+    if st.session_state.get("history_selected_date_picker") != current_selected:
+        st.session_state.history_selected_date_picker = current_selected
+
+    st.markdown("#### 달력 기반 적중 탐색")
+    st.caption("캘린더에서 날짜를 선택하면 해당 일자의 로그를 확인할 수 있습니다. 아래 적중 매칭 표는 실제 당첨번호가 확정된 대상회차만 표시하며, 최신 예측 대상회차와 확정 회차가 다르면 그 차이를 함께 안내합니다. 기존 유형별 요약·상세 로그 영역은 제거했습니다.")
+
+    picker_col, prev_col, today_col, next_col = st.columns([2.2, 1.0, 0.9, 1.0])
+    with picker_col:
+        selected_date = st.date_input(
+            "기준 일자 선택",
+            min_value=min_date,
+            max_value=max_date,
+            key="history_selected_date_picker",
+            on_change=_sync_history_selected_date_from_picker,
+        )
+        st.session_state.history_selected_date = _coerce_date_value(selected_date, current_selected)
+    with prev_col:
+        st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+        if st.button("◀ 이전 달", use_container_width=True, key="history_prev_month"):
+            st.session_state.history_selected_date = _shift_month(st.session_state.history_selected_date, -1)
+            st.rerun(scope="fragment")
+    with today_col:
+        st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+        if st.button("최신", use_container_width=True, key="history_latest_date"):
+            st.session_state.history_selected_date = latest_date
+            st.rerun(scope="fragment")
+    with next_col:
+        st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+        if st.button("다음 달 ▶", use_container_width=True, key="history_next_month"):
+            st.session_state.history_selected_date = _shift_month(st.session_state.history_selected_date, 1)
+            st.rerun(scope="fragment")
+
+    selected_date = st.session_state.history_selected_date
+    _render_clickable_calendar(analytics_df, selected_date)
+
+    selected_date_str = selected_date.strftime("%Y-%m-%d")
+    day_df = analytics_df[analytics_df["date_kst"] == selected_date_str].copy()
+
+    with st.expander(f"선택 일자 요약 · {selected_date_str}", expanded=False):
+        _render_period_kpis(day_df, "선택 일자")
+        if day_df.empty:
+            st.info("선택한 날짜의 로그가 없습니다.")
+        else:
+            st.caption("선택 일자 요약은 필요할 때만 펼쳐서 확인할 수 있습니다.")
+
+    with st.expander(f"적중 매칭 보기 · {selected_date_str}", expanded=False):
+        if day_df.empty:
+            st.info("선택한 날짜의 로그가 없습니다.")
+        else:
+            _render_selected_day_match_board(day_df, selected_date_str, report_dir)
+
+
+def _prepare_log_date_filter(logs_df: pd.DataFrame) -> tuple[pd.DataFrame, list[date]]:
+    prepared_df = logs_df.copy()
+    if prepared_df.empty:
+        prepared_df["date_obj"] = pd.Series(dtype="object")
+        return prepared_df, []
+
+    if "date_obj" not in prepared_df.columns:
+        prepared_df["date_obj"] = pd.Series(dtype="object", index=prepared_df.index)
+
+    if prepared_df["date_obj"].isna().all():
+        if "date_kst" in prepared_df.columns:
+            parsed_dates = pd.to_datetime(prepared_df["date_kst"], errors="coerce")
+        elif "timestamp_kst" in prepared_df.columns:
+            parsed_dates = pd.to_datetime(prepared_df["timestamp_kst"], errors="coerce")
+        elif "timestamp" in prepared_df.columns:
+            parsed_dates = pd.to_datetime(prepared_df["timestamp"], utc=True, errors="coerce")
+        else:
+            parsed_dates = pd.Series(pd.NaT, index=prepared_df.index)
+        prepared_df["date_obj"] = parsed_dates.dt.date
+
+    available_dates = [d for d in prepared_df["date_obj"].dropna().drop_duplicates().tolist() if d is not None]
+    available_dates = sorted(available_dates)
+    return prepared_df, available_dates
+
+
+
+def _render_log_date_filter(logs_df: pd.DataFrame, key_prefix: str, current_target_round: int | None = None) -> tuple[pd.DataFrame, str]:
+    prepared_df, available_dates = _prepare_log_date_filter(logs_df)
+    if not available_dates:
+        st.info("이 로그에는 날짜 검색에 사용할 수 있는 일자 정보가 없습니다.")
+        return prepared_df, "기간 정보 없음"
+
+    min_date = available_dates[0]
+    max_date = available_dates[-1]
+    start_key = f"{key_prefix}_filter_start"
+    end_key = f"{key_prefix}_filter_end"
+    mode_key = f"{key_prefix}_filter_mode"
+    selected_round_key = f"{key_prefix}_selected_round"
+    selected_label_key = f"{key_prefix}_selected_round_label"
+
+    has_target_round = current_target_round is not None and int(current_target_round) > 1
+    ui_min_date = min_date
+    ui_max_date = max_date
+    if has_target_round:
+        previous_window = _resolve_target_round_week_window(int(current_target_round) - 1)
+        current_window = _resolve_target_round_week_window(int(current_target_round))
+        if previous_window is not None:
+            ui_min_date = min(ui_min_date, previous_window[0])
+            ui_max_date = max(ui_max_date, previous_window[1])
+        if current_window is not None:
+            ui_min_date = min(ui_min_date, current_window[0])
+            ui_max_date = max(ui_max_date, current_window[1])
+
+    # [v69] date_input 위젯 키(_picker)를 단일 소스로 사용한다.
+    # value= 와 Session State 동시 설정 시 발생하던 경고를 없애기 위해
+    # value= 는 쓰지 않고, 위젯 생성 전에 _picker 키만 시드(seed)한다.
+    start_picker_key = f"{start_key}_picker"
+    end_picker_key = f"{end_key}_picker"
+    start_value = _coerce_date_value(
+        st.session_state.get(start_picker_key, st.session_state.get(start_key)), ui_min_date
+    )
+    end_value = _coerce_date_value(
+        st.session_state.get(end_picker_key, st.session_state.get(end_key)), ui_max_date
+    )
+    if start_value < ui_min_date or start_value > ui_max_date:
+        start_value = ui_min_date
+    if end_value < ui_min_date or end_value > ui_max_date:
+        end_value = ui_max_date
+    if start_value > end_value:
+        start_value, end_value = ui_min_date, ui_max_date
+
+    # 범위를 벗어났거나 아직 시드되지 않은 경우에만 갱신(사용자 선택은 보존)
+    if st.session_state.get(start_picker_key) != start_value:
+        st.session_state[start_picker_key] = start_value
+    if st.session_state.get(end_picker_key) != end_value:
+        st.session_state[end_picker_key] = end_value
+    st.session_state[start_key] = start_value
+    st.session_state[end_key] = end_value
+    if st.session_state.get(mode_key) not in {"date", "round_week"}:
+        # 기본 필터를 '이번주'로 설정 (사용자 요청)
+        if has_target_round:
+            window = _resolve_target_round_week_window(int(current_target_round))
+            if window is not None:
+                st.session_state[start_key] = window[0]
+                st.session_state[end_key] = window[1]
+                st.session_state[f"{start_key}_picker"] = window[0]
+                st.session_state[f"{end_key}_picker"] = window[1]
+                st.session_state[mode_key] = "round_week"
+                st.session_state[selected_round_key] = int(current_target_round)
+                st.session_state[selected_label_key] = "이번주"
+            else:
+                st.session_state[mode_key] = "date"
+        else:
+            st.session_state[mode_key] = "date"
+
+    st.markdown("##### 분석 로그 필터")
+    column_spec = [1.0, 1.0, 0.8, 0.95, 0.95] if has_target_round else [1.15, 1.15, 0.85]
+    filter_cols = st.columns(column_spec)
+
+    with filter_cols[0]:
+        start_date = st.date_input(
+            "시작일",
+            min_value=ui_min_date,
+            max_value=ui_max_date,
+            key=start_picker_key,
+            on_change=_set_log_filter_mode,
+            args=(mode_key, "date"),
+        )
+    with filter_cols[1]:
+        end_date = st.date_input(
+            "종료일",
+            min_value=ui_min_date,
+            max_value=ui_max_date,
+            key=end_picker_key,
+            on_change=_set_log_filter_mode,
+            args=(mode_key, "date"),
+        )
+    with filter_cols[2]:
+        st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+        st.button(
+            "전체 기간",
+            key=f"{key_prefix}_filter_reset",
+            use_container_width=True,
+            on_click=_reset_log_date_filter,
+            args=(start_key, end_key, min_date, max_date, mode_key),
+        )
+
+    if has_target_round:
+        previous_target_round = int(current_target_round) - 1
+        with filter_cols[3]:
+            st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+            st.button(
+                f"전주 {previous_target_round}회 로그",
+                key=f"{key_prefix}_filter_prev_round",
+                use_container_width=True,
+                on_click=_set_round_week_filter,
+                args=(previous_target_round, "전주", start_key, end_key, mode_key, selected_round_key, selected_label_key),
+            )
+        with filter_cols[4]:
+            st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
+            st.button(
+                f"이번주 {int(current_target_round)}회 로그",
+                key=f"{key_prefix}_filter_current_round",
+                use_container_width=True,
+                on_click=_set_round_week_filter,
+                args=(int(current_target_round), "이번주", start_key, end_key, mode_key, selected_round_key, selected_label_key),
+            )
+
+    st.session_state[start_key] = _coerce_date_value(start_date, ui_min_date)
+    st.session_state[end_key] = _coerce_date_value(end_date, ui_max_date)
+    if st.session_state[start_key] > st.session_state[end_key]:
+        st.warning("시작일이 종료일보다 늦습니다. 날짜 범위를 다시 선택해 주세요.")
+        return prepared_df.iloc[0:0].copy(), f"{st.session_state[start_key]} ~ {st.session_state[end_key]}"
+
+    filtered_df = prepared_df[
+        (prepared_df["date_obj"] >= st.session_state[start_key]) & (prepared_df["date_obj"] <= st.session_state[end_key])
+    ].copy()
+    period_range = f"{st.session_state[start_key].strftime('%Y-%m-%d')} ~ {st.session_state[end_key].strftime('%Y-%m-%d')}"
+
+    filter_mode = st.session_state.get(mode_key, "date")
+    selected_round = st.session_state.get(selected_round_key)
+    selected_label = st.session_state.get(selected_label_key)
+    if filter_mode == "round_week" and selected_round is not None and selected_label:
+        period_label = f"{selected_label} {int(selected_round)}회 로그"
+        st.caption(f"선택 기간: {period_range} · {period_label} 기준으로 날짜 범위를 자동 반영했습니다.")
+        return filtered_df, f"{period_label} · {period_range}"
+
+    st.caption(f"선택 기간: {period_range} · 날짜 기준으로 로그를 바로 검색할 수 있습니다.")
+    return filtered_df, period_range
+
+
+
+def _render_single_log_tab(filtered: pd.DataFrame, title: str, empty_message: str, current_target_round: int | None = None, log_token: tuple | None = None):
+    st.markdown(f"#### {title}")
+    if filtered.empty:
+        st.info(empty_message)
+        return
+
+    key_prefix = title.replace(" ", "_").lower()
+    filtered_by_date, period_label = _render_log_date_filter(filtered, key_prefix, current_target_round=current_target_round)
+    if filtered_by_date.empty:
+        st.info("선택한 조건에 해당하는 로그가 없습니다.")
+        return
+
+    score_series = pd.to_numeric(filtered_by_date.get("score_metric"), errors="coerce")
+    score_values = score_series.dropna()
+    _render_stats_grid(
+        st,
+        [
+            ("저장 건수", f"{len(filtered_by_date):,}", "선택한 날짜 범위에 포함된 로그 수입니다."),
+            ("평균 대표 점수", f"{score_values.mean():.3f}" if not score_values.empty else "-", "대표 점수 기준 평균값입니다."),
+            ("조회 기간", period_label, "현재 적용 중인 로그 조회 기준입니다."),
+        ],
+    )
+
+    _render_log_detail_table(filtered_by_date, title, key_prefix, preview_limit=500, csv_token=log_token)
+    st.caption("표에는 최근 500건만 표시하고(속도 개선), 전체는 아래 CSV 다운로드로 받을 수 있습니다. 날짜 검색으로 원하는 구간을 좁혀 보세요.")
+
+
+
+
+
+def _apply_simulation_count(project_dir: Path, new_count: int) -> None:
+    sanitized = _sanitize_simulation_count(new_count)
+    st.session_state.simulation_count = sanitized
+    st.session_state.simulation_notice = f"시뮬레이션 규모가 {sanitized:,}회로 변경되었습니다. 다음 추천부터 바로 반영됩니다."
+    _persist_runtime_state(project_dir)
+
+
+def _render_simulation_form(project_dir: Path, form_key: str, caption_text: str) -> None:
+    with st.form(form_key, clear_on_submit=False):
+        current_count = _current_simulation_count()
+        simulation_count = st.number_input(
+            "시뮬레이션 규모",
+            min_value=1000,
+            max_value=50000,
+            step=500,
+            value=current_count,
+            help="추천 계산 반복 횟수입니다. 값이 커질수록 탐색 폭은 넓어지지만 응답 시간도 함께 늘어납니다.",
+        )
+        password = st.text_input("변경 비밀번호", type="password", key=f"{form_key}_password")
+        submitted = st.form_submit_button("시뮬레이션 규모 적용", use_container_width=True)
+        if submitted:
+            if not password:
+                st.warning("변경 비밀번호를 먼저 입력해 주세요.")
+            elif password != SIMULATION_EDIT_PASSWORD:
+                st.error("비밀번호가 올바르지 않습니다.")
+            else:
+                _apply_simulation_count(project_dir, int(simulation_count))
+                st.rerun()
+    st.caption(caption_text)
+
+
+def _render_simulation_control(project_dir: Path, variant: str = SIMULATION_PANEL_VARIANT) -> None:
+    current_count = _current_simulation_count()
+    if st.session_state.get("simulation_notice"):
+        st.success(st.session_state.simulation_notice)
+        st.session_state.simulation_notice = None
+
+    st.markdown("#### 시뮬레이션 규모 설정")
+    
+    if variant == "A":
+        left, right = st.columns([1.08, 0.92])
+        with left:
+            st.markdown(
+                f"""
+                <div class="sim-card">
+                    <div class="eyebrow">Simulation Status</div>
+                    <h4>현재 운영 규모를 먼저 확인한 뒤 변경</h4>
+                    <p>시뮬레이션 횟수가 높을수록 통계적 유의성은 상승하지만, 브라우저의 응답 속도가 느려질 수 있습니다. 일반적인 분석에는 5,000~10,000회 설정을 권장합니다.</p>
+                    <span class="sim-value">{current_count:,}회</span>
+                    <div class="sim-badge-row">
+                        <span class="sim-badge">권장 시작값 · 5,000회</span>                        
+                    </div>
+                    <ul class="sim-meta-list">
+                        <li>규모를 높이는 것은 "데이터의 해상도"를 높이는 것과 같습니다.</li>
+                        <li>해상도가 너무 높으면 오히려 노이즈(데이터 왜곡)가 발생할 수 있습니다.</li>
+                        <li>무조건 높이는 것보다, 최근 데이터(Short-term)와 과거 데이터(Long-term)의 가중치를 조절하는 것이 더 정밀한 결과를 도출할 수 있다</li>
+                    </ul>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with right:
+            st.markdown(
+                """
+                <div class="unlock-shell">
+                    <div class="title">🔐 시뮬레이션 규모 변경 안내</div>
+                    <div class="desc">비밀번호를 넣어야만 시뮬레이션 규모를 변경할수 있습니다.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            _render_simulation_form(project_dir, "simulation_form_a", "변경 후에는 다음 추천 실행부터 새 규모가 반영됩니다.")
+        return
+
+    if variant == "B":
+        st.markdown(
+            f"""
+            <div class="sim-banner">
+                <div class="eyebrow">History Control Deck</div>
+                <h4>분석 화면에서 바로 읽는 시뮬레이션 규모 배너</h4>
+                <p>현재 적용 중인 규모를 배너에서 먼저 확인하고, 하단 카드에서 변경 이유와 보안 절차를 나눠 읽을 수 있게 정리했습니다.</p>
+                <div class="sim-mini-grid">
+                    <div class="sim-mini-item">
+                        <div class="sim-mini-label">현재 적용 규모</div>
+                        <div class="sim-mini-value">{current_count:,}회</div>
+                    </div>
+                    <div class="sim-mini-item">
+                        <div class="sim-mini-label">권장 기준</div>
+                        <div class="sim-mini-value">5,000회</div>
+                    </div>
+                    <div class="sim-mini-item">
+                        <div class="sim-mini-label">변경 보안</div>
+                        <div class="sim-mini-value">PW 인증</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(
+                f"""
+                <div class="sim-card">
+                    <div class="eyebrow">Current State</div>
+                    <h4>현재 값</h4>
+                    <p>현재 추천 계산에 쓰이는 반복 횟수입니다.</p>
+                    <span class="sim-value">{current_count:,}회</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col2:
+            st.markdown(
+                """
+                <div class="sim-card">
+                    <div class="eyebrow">Guide</div>
+                    <h4>변경 가이드</h4>
+                    <p>빠른 응답이 중요하면 3,000~5,000회, 탐색 폭을 넓히려면 7,500~10,000회 수준이 무난합니다.</p>
+                    <div class="sim-form-caption">로그 파일은 유지되고 설정값만 변경됩니다.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col3:
+            st.markdown(
+                """
+                <div class="unlock-shell">
+                    <div class="title">🔐 보안 변경</div>
+                    <div class="desc">원본 데이터 확인과 비슷한 톤으로, 비밀번호 인증 뒤에만 값 변경이 되도록 구성했습니다.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            _render_simulation_form(project_dir, "simulation_form_b", "저장 즉시 런타임 설정에 반영되며 로그 이력은 유지됩니다.")
+        return
+
+    st.markdown(
+        f"""
+        <div class="sim-console">
+            <div class="sim-console-top">
+                <div>
+                    <div class="eyebrow">Simulation Console</div>
+                    <h4>로그 분석 화면 안에 붙는 일체형 관리 콘솔</h4>
+                    <p>현재 규모 확인과 보안 변경 흐름을 하나의 콘솔 안에 압축해, 운영자가 빠르게 읽고 즉시 바꿀 수 있도록 설계했습니다.</p>
+                </div>
+                <div class="sim-console-kpis">
+                    <div class="sim-console-kpi"><span>현재 규모</span><b>{current_count:,}회</b></div>
+                    <div class="sim-console-kpi"><span>보안 비밀번호</span><b>설정 필요</b></div>
+                    <div class="sim-console-kpi"><span>저장 방식</span><b>설정값만 반영</b></div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _render_simulation_form(project_dir, "simulation_form_c", "패턴 추천·확률 추천 모두 동일한 시뮬레이션 규모를 공유합니다.")
+
+def _render_top5_log_tab(
+    project_dir: Path,
+    excel_path: Path,
+    excel_cache_token: tuple,
+) -> None:
+    """TOP5 예측 로그 탭 — top5_log.jsonl 전체 조회 + 당첨 결과 비교"""
+    from log_utils import load_top5_log, LOG_FILE_MAP
+
+    records = load_top5_log(project_dir)
+
+    # ── 헤더 ──────────────────────────────────────────────────────────
+    st.markdown("#### TOP5 예측 로그")
+    st.caption(
+        "매일 오전 8시 GHA가 생성한 패턴/확률/수동 TOP5 번호를 날짜·회차별로 조회합니다. "
+        "추첨이 완료된 회차는 실제 당첨번호와 자동 비교해 1등~낙점 결과를 표시합니다."
+    )
+
+    if not records:
+        st.info("아직 TOP5 로그가 없습니다. 내일 오전 9시 GHA 실행 후 데이터가 쌓입니다.")
+        # 다운로드 버튼은 파일이 없어도 표시
+        _render_download_button(
+            project_dir / "logs" / LOG_FILE_MAP["top5"],
+            "top5_log.jsonl 다운로드", "application/json", "dl_top5_empty"
+        )
+        return
+
+    # ── 실제 당첨번호 맵 ─────────────────────────────────────────────
+    actual_map = _load_actual_result_map(str(excel_path), excel_cache_token)
+
+    # ── 필터 UI ───────────────────────────────────────────────────────
+    all_rounds = sorted(
+        set(r.get("target_round", 0) for r in records if r.get("target_round")),
+        reverse=True,
+    )
+    all_dates = sorted(
+        set(str(r.get("created_date_kst", ""))[:10] for r in records if r.get("created_date_kst")),
+        reverse=True,
+    )
+    all_types = ["전체", "prediction (패턴)", "probability (확률)", "manual (수동)"]
+
+    col_r, col_d, col_t = st.columns([1.2, 1.2, 1.2])
+    with col_r:
+        round_options = ["전체 회차"] + [
+            f"{r}회차 {'✅' if r in actual_map else '⏳'}" for r in all_rounds
+        ]
+        sel_round_label = st.selectbox("회차 필터", round_options, key="top5_tab_round")
+        sel_round = None if sel_round_label == "전체 회차" else int(sel_round_label.split("회차")[0])
+    with col_d:
+        date_options = ["전체 날짜"] + all_dates
+        sel_date_label = st.selectbox("날짜 필터", date_options, key="top5_tab_date")
+        sel_date = None if sel_date_label == "전체 날짜" else sel_date_label
+    with col_t:
+        sel_type_label = st.selectbox("유형 필터", all_types, key="top5_tab_type")
+        sel_type = None if sel_type_label == "전체" else sel_type_label.split(" ")[0]
+
+    # ── 필터 적용 ─────────────────────────────────────────────────────
+    filtered = records
+    if sel_round:
+        filtered = [r for r in filtered if r.get("target_round") == sel_round]
+    if sel_date:
+        filtered = [r for r in filtered if str(r.get("created_date_kst", ""))[:10] == sel_date]
+    if sel_type:
+        filtered = [r for r in filtered if r.get("top5_type") == sel_type]
+
+    # ── 요약 메트릭 ────────────────────────────────────────────────────
+    total = len(filtered)
+    confirmed = sum(1 for r in filtered if r.get("target_round") in actual_map)
+    hits = {"1등": 0, "2등": 0, "3등": 0, "4등": 0, "5등": 0, "낙점": 0}
+    for r in filtered:
+        ai = actual_map.get(r.get("target_round"))
+        if not ai:
+            continue
+        nums = r.get("numbers", [])
+        matched = len(set(nums) & set(ai.get("actual_numbers", [])))
+        bonus_match = bool(ai.get("bonus_number") and ai.get("bonus_number") in nums)
+        hits[_prize_label_from_match(matched, bonus_match)] += 1
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("전체 TOP5 건수", total)
+    m2.metric("결과 확정 건수", confirmed)
+    m3.metric("3등 이상", hits["1등"] + hits["2등"] + hits["3등"])
+    m4.metric("4~5등", hits["4등"] + hits["5등"])
+    m5.metric("낙점", hits["낙점"])
+
+    st.markdown("---")
+
+    # ── 카드 렌더 ─────────────────────────────────────────────────────
+    PRIZE_COLOR = {
+        "1등": "#ffd700", "2등": "#c0c0c0", "3등": "#cd7f32",
+        "4등": "#38bdf8", "5등": "#86efac", "낙점": "#6b7280",
+    }
+    PRIZE_ICON = {
+        "1등": "", "2등": "", "3등": "",
+        "4등": "4등", "5등": "5등", "낙점": "낙점",
+    }
+    TYPE_LABEL = {"prediction": "🔵 패턴", "probability": "🟣 확률", "manual": "🟢 수동"}
+
+    # 날짜·회차·유형·순위 순 정렬
+    sorted_records = sorted(
+        filtered,
+        key=lambda x: (
+            str(x.get("created_date_kst", ""))[:10],
+            x.get("target_round", 0),
+            x.get("top5_type", ""),
+            x.get("candidate_rank", 99),
+        ),
+        reverse=True,
+    )
+
+    if not sorted_records:
+        st.info("필터 조건에 맞는 TOP5 로그가 없습니다.")
+    else:
+        # 날짜+회차+유형 기준으로 그룹핑해서 표시
+        from itertools import groupby
+        from operator import itemgetter
+
+        def group_key(r):
+            return (
+                str(r.get("created_date_kst", ""))[:10],
+                r.get("target_round", 0),
+                r.get("top5_type", ""),
+            )
+
+        for (date_str, t_round, t_type), group in groupby(sorted_records, key=group_key):
+            group_list = list(group)
+            ai = actual_map.get(t_round)
+            type_label = TYPE_LABEL.get(t_type, t_type)
+            result_badge = "✅ 결과확정" if ai else "⏳ 추첨대기"
+
+            with st.expander(
+                f"{date_str} │ {t_round}회차 {result_badge} │ {type_label}",
+                expanded=(ai is not None and sel_round is not None),
+            ):
+                # 당첨번호 표시
+                if ai:
+                    actual_nums = ai.get("actual_numbers", [])
+                    bonus = ai.get("bonus_number")
+                    balls = " ".join(
+                        f'<span style="display:inline-block;width:28px;height:28px;border-radius:50%;'
+                        f'background:#F4F1EA;border:1px solid rgba(28,25,20,0.14);color:{_get_ball_color_hex(n)};font-weight: 600;'
+                        f'text-align:center;line-height:28px;font-size:0.8em;margin:1px;">{n:02d}</span>'
+                        for n in sorted(actual_nums)
+                    )
+                    bonus_span = (
+                        f'&nbsp;<span style="color:#9A9489;font-size:0.8em;">보너스</span>'
+                        f'<span style="display:inline-block;width:24px;height:24px;border-radius:50%;'
+                        f'background:#F2EFE8;color:#5A6169;font-weight:700;text-align:center;'
+                        f'line-height:24px;font-size:0.75em;margin:1px;border:1px dashed rgba(28,25,20,0.30);">{bonus:02d}</span>'
+                        if bonus else ""
+                    )
+                    st.markdown(
+                        f'<div style="background:rgba(45,74,107,0.06);border:1px solid rgba(45,74,107,0.2);'
+                        f'border-radius:8px;padding:8px 12px;margin-bottom:8px;">'
+                        f'<span style="color:#2D4A6B;font-weight:600;">{t_round}회차 당첨번호</span>&nbsp;'
+                        f'{balls}{bonus_span}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # TOP5 카드
+                for rec in group_list:
+                    nums = rec.get("numbers", [])
+                    rank = rec.get("candidate_rank", "?")
+                    score = rec.get("score", 0)
+
+                    if ai:
+                        actual_nums = ai.get("actual_numbers", [])
+                        bonus = ai.get("bonus_number")
+                        matched = sorted(set(nums) & set(actual_nums))
+                        bonus_match = bool(bonus and bonus in nums)
+                        hit = len(matched)
+                        prize = _prize_label_from_match(hit, bonus_match)
+                        prize_color = PRIZE_COLOR.get(prize, "#6b7280")
+                        prize_icon = PRIZE_ICON.get(prize, prize)
+                        result_str = (
+                            f'<span style="color:{prize_color};font-weight: 600;min-width:40px;">'
+                            f'{prize_icon}</span>'
+                            f'<span style="color:#94a3b8;font-size:0.8em;">&nbsp;{hit}개 일치'
+                            + (f'&nbsp;+보너스' if bonus_match and hit < 6 else '')
+                            + '</span>'
+                        )
+                        balls_html = " ".join(
+                            f'<span style="display:inline-block;width:28px;height:28px;border-radius:50%;'
+                            f'background:#F4F1EA;border:1px solid rgba(28,25,20,0.14);color:{_get_ball_color_hex(n)};font-weight: 600;'
+                            f'text-align:center;line-height:28px;font-size:0.8em;margin:1px;'
+                            + ('outline:2px solid #2D4A6B;' if n in matched else '')
+                            + f'">{n:02d}</span>'
+                            for n in sorted(nums)
+                        )
+                    else:
+                        result_str = '<span style="color:#6b7280;">추첨 대기</span>'
+                        balls_html = " ".join(
+                            f'<span style="display:inline-block;width:28px;height:28px;border-radius:50%;'
+                            f'background:#F4F1EA;border:1px solid rgba(28,25,20,0.14);color:{_get_ball_color_hex(n)};font-weight: 600;'
+                            f'text-align:center;line-height:28px;font-size:0.8em;margin:1px;">{n:02d}</span>'
+                            for n in sorted(nums)
+                        )
+
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;'
+                        f'padding:7px 10px;border-radius:6px;margin-bottom:4px;'
+                        f'background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);">'
+                        f'<span style="color:#94a3b8;min-width:44px;font-weight:700;">{rank}순위</span>'
+                        f'<div>{balls_html}</div>'
+                        f'<span style="color:#475569;font-size:0.78em;">점수 {score:.4f}</span>'
+                        f'&nbsp;{result_str}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # ── CSV 다운로드 ──────────────────────────────────────────────────
+    if records:
+        import io as _io, csv as _csv
+        output = _io.StringIO()
+        fieldnames = ["created_date_kst", "target_round", "source_round",
+                      "top5_type", "candidate_rank", "numbers", "score"]
+        writer = _csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in sorted(records, key=lambda x: (
+            str(x.get("created_date_kst", ""))[:10],
+            x.get("target_round", 0),
+            x.get("top5_type", ""),
+            x.get("candidate_rank", 99),
+        ), reverse=True):
+            row = {k: r.get(k, "") for k in fieldnames}
+            nums = row["numbers"]
+            row["numbers"] = "-".join(str(n) for n in nums) if isinstance(nums, list) else nums
+            writer.writerow(row)
+        st.download_button(
+            label="📥 TOP5 로그 CSV 다운로드",
+            data=output.getvalue().encode("utf-8-sig"),
+            file_name="top5_log.csv",
+            mime="text/csv",
+            key="dl_top5_csv",
+            use_container_width=True,
+        )
+
+
+def _get_ball_color_hex(n: int) -> str:
+    """번호별 볼 색상 (hex)."""
+    if n <= 10:  return "#B8860B"
+    if n <= 20:  return "#1565C0"
+    if n <= 30:  return "#C62828"
+    if n <= 40:  return "#546E7A"
+    return "#2E7D32"
+
+
+def _log_cache_token(project_dir: Path) -> tuple:
+    """logs 디렉터리의 DB/JSONL 파일 상태(크기·수정시각)로 캐시 토큰 생성.
+    파일이 바뀌면(새 로그 저장 / GHA 동기화) 토큰이 달라져 캐시가 자동 무효화된다."""
+    log_dir = Path(project_dir) / "logs"
+    names = (
+        "lotto_history.db",
+        "prediction_log.jsonl",
+        "probability_log.jsonl",
+        "manual_score_log.jsonl",
+        "analysis_summary_log.jsonl",
+        "top5_log.jsonl",
+    )
+    token = []
+    for name in names:
+        p = log_dir / name
+        try:
+            stt = p.stat()
+            token.append((name, stt.st_size, int(stt.st_mtime_ns)))
+        except OSError:
+            token.append((name, -1, -1))
+    return tuple(token)
+
+
+@st.cache_data(show_spinner=False)
+def _load_enriched_history_cached(
+    project_dir_str: str,
+    excel_path_str: str,
+    excel_cache_token: tuple,
+    log_token: tuple,
+) -> pd.DataFrame:
+    """로그 결합 로드 + 실제 당첨결과 매칭 결과를 캐시한다.
+    log_token 이 동일하면(파일 미변경) 재계산 없이 캐시를 재사용하므로,
+    탭 전환·날짜 변경 같은 잦은 rerun 에서 SQLite 재조회와 수천 행
+    iterrows 재실행을 건너뛴다. log_token 은 캐시 키 용도로만 쓰인다."""
+    history_df = load_combined_log_history(project_dir_str)
+    return _enrich_logs_with_actual_results(history_df, Path(excel_path_str), excel_cache_token)
+
+
+def _render_analysis_view(
+    summary: dict,
+    project_dir: Path,
+    report_dir: Path,
+    predictor: "LottoPredictor",
+    excel_path: Path,
+    excel_cache_token: tuple[str, int, int],
+    latest_source_round: int | None = None,
+):
+    _log_mem("로그분석 뷰 진입")
+    log_token = _log_cache_token(project_dir)
+    history_df = _load_enriched_history_cached(
+        str(project_dir), str(excel_path), excel_cache_token, log_token
+    )
+    status_df = build_log_status_table(project_dir)
+    matched_df = _read_report_csv(report_dir, "match", "prediction_actual_match.csv")
+    threshold_df = _read_report_csv(report_dir, "threshold", "threshold_analysis.csv")
+    timeseries_df = _read_report_csv(report_dir, "timeseries", "score_timeseries.csv")
+    _log_mem("로그분석 데이터 로드 후")
+
+    st.markdown("### 로그 분석 · 히스토리")
+    st.caption("저장 로그를 달력과 로그 유형 탭 중심으로 정리했습니다. 중복되던 일별·주별·월별 분석 항목은 제거했습니다.")
+
+    total_logs = int(len(history_df)) if not history_df.empty else 0
+    last_saved = "-"
+    if not history_df.empty and history_df["timestamp_kst"].replace("-", pd.NA).dropna().any():
+        last_saved = history_df["timestamp_kst"].replace("-", pd.NA).dropna().iloc[0]
+
+    # ── 분석 카드 (성과·다음 추첨 중심으로 재구성) ──────────────────────
+    analyzed_round = int(latest_source_round) if latest_source_round is not None else int(predictor.total_draws)
+    next_round = analyzed_round + 1
+
+    # 다음 추첨(토요일)까지 D-day (KST 기준, 월=0 ... 토=5)
+    _today_kst = datetime.now(KST).date()
+    _dday = (5 - _today_kst.weekday()) % 7
+    _dday_str = "오늘 추첨" if _dday == 0 else f"D-{_dday}"
+
+    # matched_df 수치 컬럼 안전 변환 (배포 환경에서 채워짐 / 비어 있어도 '-' 처리)
+    def _mcol(col):
+        if matched_df is None or matched_df.empty or col not in matched_df.columns:
+            return pd.Series(dtype="float64")
+        return pd.to_numeric(matched_df[col], errors="coerce")
+
+    _hit = _mcol("hit_count")
+    _prize = _mcol("prize_order")
+    _tround = _mcol("target_round")
+    _has_match = matched_df is not None and not matched_df.empty
+
+    # 누적 4등(=prize_order 4) / 5등(=prize_order 5)
+    _cnt4 = int((_prize == 4).sum())
+    _cnt5 = int((_prize == 5).sum())
+    _hit45_str = f"4등 {_cnt4} · 5등 {_cnt5}" if _has_match else "-"
+
+    # 최고 적중 기록 (단일 추천 최다 일치)
+    _best = int(_hit.max()) if _hit.notna().any() else 0
+    _best_str = f"{_best}개 일치" if _best else "-"
+
+    # 마지막 적중 회차 (4등 이상 = prize_order 1~4)
+    _prized = _tround[(_prize >= 1) & (_prize <= 4)]
+    _last_round = int(_prized.max()) if _prized.notna().any() else None
+    _last_str = f"{_last_round:,}회" if _last_round else "아직 없음"
+
+    # 최근 회차(분석 회차) 4·5등
+    _rmask = _tround == analyzed_round
+    _r4 = int(((_prize == 4) & _rmask).sum())
+    _r5 = int(((_prize == 5) & _rmask).sum())
+
+    # 누적 3개 이상 적중 비율
+    threshold = summary.get("recommended_threshold") or {}
+    _rate = threshold.get("hit_3_plus_rate")
+    _rate_str = f"{_rate:.2%}" if isinstance(_rate, (int, float)) else "-"
+
+    # 오늘 생성된 추천 건수
+    _today_str = _today_kst.strftime("%Y-%m-%d")
+    _today_cnt = 0
+    if not history_df.empty and "date_kst" in history_df.columns:
+        _today_cnt = int((history_df["date_kst"].astype(str) == _today_str).sum())
+
+    # 핫/콜드 넘버: 실제 당첨번호 1회차~현재 역대 빈도 (lotto.xlsx 전체 회차의 번호1~6)
+    import json as _json_hc
+    from collections import Counter as _Counter_hc
+
+    def _nums_cell(cell):
+        if isinstance(cell, (list, tuple)):
+            seq = cell
+        elif isinstance(cell, str) and cell.strip():
+            try:
+                seq = _json_hc.loads(cell)
+            except Exception:
+                seq = []
+        else:
+            seq = []
+        out = []
+        if isinstance(seq, (list, tuple)):
+            for n in seq:
+                try:
+                    out.append(int(n))
+                except Exception:
+                    pass
+        return out
+
+    _hist_counter = _Counter_hc()
+    try:
+        _xdf_hc = _read_excel_cached(str(excel_path), excel_cache_token)
+        if _xdf_hc is not None and not _xdf_hc.empty:
+            for _i in range(1, 7):
+                _col = f"번호{_i}"
+                if _col in _xdf_hc.columns:
+                    for _v in pd.to_numeric(_xdf_hc[_col], errors="coerce").dropna():
+                        _iv = int(_v)
+                        if 1 <= _iv <= 45:
+                            _hist_counter[_iv] += 1
+    except Exception:
+        pass
+
+    if _hist_counter:
+        _freq_full = {n: _hist_counter.get(n, 0) for n in range(1, 46)}
+        _hot_nums = sorted(sorted(_freq_full, key=lambda x: -_freq_full[x])[:3])
+        _cold_nums = sorted(sorted(_freq_full, key=lambda x: _freq_full[x])[:3])
+        _hot_html = _lotto_balls_html(_hot_nums)
+        _cold_html = _lotto_balls_html(_cold_nums)
+    else:
+        _hot_html = _cold_html = "-"
+
+    # 오늘 추천 1위 조합 (오늘 로그 중 점수 최고) → 공 색상으로 표시
+    _today_top_html = "-"
+    if not history_df.empty and "date_kst" in history_df.columns and "numbers_json" in history_df.columns:
+        _tdf = history_df[history_df["date_kst"].astype(str) == _today_str]
+        if not _tdf.empty and "score" in _tdf.columns:
+            _tsc = pd.to_numeric(_tdf["score"], errors="coerce")
+            if _tsc.notna().any():
+                _top_nums = _nums_cell(_tdf.loc[_tsc.idxmax(), "numbers_json"])
+                if _top_nums:
+                    _today_top_html = _lotto_balls_html(sorted(_top_nums))
+
+    # 누적 추천 건수: 추천 로그(패턴+확률+수동)만 DB 전체 COUNT 기준 (12만 로딩 상한과 무관, 항상 정확)
+    _rec_total = 0
+    if status_df is not None and not status_df.empty and "log_type" in status_df.columns and "records" in status_df.columns:
+        _rec_mask = status_df["log_type"].isin(["prediction", "probability", "manual"])
+        _rec_total = int(pd.to_numeric(status_df.loc[_rec_mask, "records"], errors="coerce").fillna(0).sum())
+
+    _render_stats_grid(
+        st,
+        [
+            ("분석 회차", f"{analyzed_round:,}", "현재 불러온 최신 원본 회차 기준입니다."),
+            ("핫 넘버 TOP3", _hot_html, "역대(1회차~현재) 가장 많이 나온 당첨번호 3개입니다."),
+            ("최고 적중 기록", _best_str, "단일 추천이 실제 당첨과 가장 많이 일치한 기록입니다."),
+            ("누적 추천 건수", f"{_rec_total:,}건", "지금까지 생성된 추천(패턴+확률+수동) 전체 건수입니다."),
+            ("콜드 넘버 TOP3", _cold_html, "역대(1회차~현재) 가장 적게 나온 당첨번호 3개입니다."),
+            ("최적 임계값 3+ 적중률", _rate_str, "추천 점수 상위(최적 임계값) 구간에서 3개 이상 맞은 비율입니다. 전체 평균과는 다를 수 있습니다."),
+            ("최근 저장", last_saved, "가장 최근에 저장된 로그 시각입니다."),
+            ("오늘 추천 1위 조합", _today_top_html, "오늘 생성된 추천 중 점수가 가장 높은 조합입니다."),
+            ("다음 추첨 D-DAY", _dday_str, f"{next_round:,}회 추첨(토요일)까지 남은 일수입니다."),
+            ("오늘 생성 추천", f"{_today_cnt:,}건", "오늘 자동 생성된 추천 로그 수입니다."),
+        ],
+    )
+
+    if _has_match:
+        st.success(
+            f"최근 회차 적중 요약 · {analyzed_round:,}회 · 4등 {_r4}건 · 5등 {_r5}건"
+        )
+    else:
+        st.info("아직 실제 당첨번호와 연결된 로그가 충분하지 않아 적중 요약을 계산하지 못했습니다.")
+
+    _render_simulation_control(project_dir, SIMULATION_PANEL_VARIANT)
+
+    _render_calendar_history_section(_prepare_history_analytics(history_df, log_token), report_dir)
+
+    current_prediction_round = None
+    try:
+        if latest_source_round is not None:
+            current_prediction_round = int(latest_source_round) + 1
+    except (TypeError, ValueError):
+        current_prediction_round = None
+
+    tab_pred, tab_prob, tab_manual, tab_top5, tab_analysis = st.tabs(
+        ["패턴 분석 로그", "확률 분석 로그", "수동 점수 로그", "TOP5 예측 로그", "분석 요약 로그"]
+    )
+
+    with tab_pred:
+        pred_df = history_df[history_df["log_type"] == "prediction"].copy() if not history_df.empty else pd.DataFrame()
+        _render_single_log_tab(pred_df, "패턴 분석 로그", "아직 저장된 패턴 분석 로그가 없습니다.", current_target_round=current_prediction_round, log_token=log_token)
+
+    with tab_prob:
+        prob_df = history_df[history_df["log_type"] == "probability"].copy() if not history_df.empty else pd.DataFrame()
+        _render_single_log_tab(prob_df, "확률 분석 로그", "아직 저장된 확률 분석 로그가 없습니다.", current_target_round=current_prediction_round, log_token=log_token)
+
+    with tab_top5:
+        top5_df = history_df[history_df["log_type"] == "top5"].copy() if not history_df.empty else pd.DataFrame()
+        _render_single_log_tab(top5_df, "TOP5 예측 로그", "아직 저장된 TOP5 예측 로그가 없습니다.", current_target_round=current_prediction_round, log_token=log_token)
+
+    with tab_analysis:
+        st.markdown("#### 로그 종합 분석")
+        st.caption("패턴 · 확률 · 수동 · TOP5 로그를 모아 분석한 요약입니다. (화면 표시용 최근 로그 기준)")
+
+        if history_df.empty:
+            st.info("아직 분석할 로그가 없습니다.")
+        else:
+            import json as _json
+            from collections import Counter
+
+            def _nums_from(cell):
+                if isinstance(cell, (list, tuple)):
+                    seq = cell
+                elif isinstance(cell, str) and cell.strip():
+                    try:
+                        seq = _json.loads(cell)
+                    except Exception:
+                        seq = []
+                else:
+                    seq = []
+                out = []
+                if isinstance(seq, (list, tuple)):
+                    for n in seq:
+                        try:
+                            out.append(int(n))
+                        except Exception:
+                            pass
+                return out
+
+            # 1) 유형별 요약 (건수 · 평균/최고 적중 개수 · 최신 대상 회차)
+            #    점수는 유형마다 척도가 달라 비교 불가 → 모든 유형 공통인 '적중 개수'로 표시
+            _type_order = [
+                ("prediction", "패턴 추천"),
+                ("probability", "확률 추천"),
+                ("manual", "수동 점수"),
+                ("top5", "TOP5 예측"),
+            ]
+
+            def _mhit(df, key):
+                if df is None or df.empty or "log_type" not in df.columns:
+                    return pd.Series(dtype="float64")
+                msub = df[df["log_type"] == key]
+                if msub.empty or "hit_count" not in msub.columns:
+                    return pd.Series(dtype="float64")
+                return pd.to_numeric(msub["hit_count"], errors="coerce")
+
+            _rows = []
+            for key, label in _type_order:
+                sub = history_df[history_df["log_type"] == key]
+                cnt = int(len(sub))
+                _tr = pd.to_numeric(sub.get("target_round"), errors="coerce") if not sub.empty else pd.Series(dtype="float64")
+                _mh = _mhit(matched_df, key)
+                _rows.append({
+                    "로그유형": label,
+                    "건수": cnt,
+                    "평균 적중 개수": round(float(_mh.mean()), 2) if _mh.notna().any() else "-",
+                    "최고 적중 개수": int(_mh.max()) if _mh.notna().any() else "-",
+                    "최신 대상회차": int(_tr.max()) if _tr.notna().any() else "-",
+                })
+            st.markdown("##### 유형별 요약")
+            st.caption("적중 개수는 실제 당첨번호와 비교된 추천 기준이라, 유형 간 같은 잣대로 비교할 수 있습니다.")
+            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+            # 2) 추천 번호 빈도 (핫/콜드 넘버) — 토큰 기준 캐시로 매 rerun 재계산 방지
+            _freq = _recommend_freq_df(log_token, history_df)
+
+            if not _freq.empty:
+                hot_col, cold_col = st.columns(2)
+                with hot_col:
+                    st.markdown("##### 가장 많이 추천된 번호 TOP 10")
+                    st.dataframe(_freq.head(10), use_container_width=True, hide_index=True)
+                with cold_col:
+                    st.markdown("##### 가장 적게 추천된 번호 TOP 10")
+                    _cold = _freq.sort_values("추천 횟수", ascending=True).head(10).reset_index(drop=True)
+                    st.dataframe(_cold, use_container_width=True, hide_index=True)
+            else:
+                st.info("번호 빈도를 계산할 추천 데이터가 아직 없습니다.")
+
+        with st.expander("파일 다운로드"):
+            dl1, dl2, dl3 = st.columns(3)
+            with dl1:
+                _render_download_button(project_dir / "logs" / LOG_FILE_MAP["prediction"], "패턴 분석 로그 다운로드", "application/json", "dl_pred")
+                _render_download_button(project_dir / "logs" / LOG_FILE_MAP["probability"], "확률분석로그 다운로드", "application/json", "dl_prob")
+            with dl2:
+                _render_download_button(project_dir / "logs" / LOG_FILE_MAP["manual"], "수동번호점수로그 다운로드", "application/json", "dl_manual")
+                _render_download_button(project_dir / "logs" / LOG_FILE_MAP["analysis"], "분석요약로그 다운로드", "application/json", "dl_analysis")
+                _render_download_button(project_dir / "logs" / "lotto_history.db", "lotto_history.db 다운로드", "application/octet-stream", "dl_history_db")
+            with dl3:
+                for file_key, default_name, download_key in [
+                    ("match", "prediction_actual_match.csv", "dl_match"),
+                    ("threshold", "threshold_analysis.csv", "dl_threshold"),
+                    ("timeseries", "score_timeseries.csv", "dl_timeseries"),
+                    ("daily_summary", "daily_log_summary.csv", "dl_daily_summary"),
+                    ("weekly_summary", "weekly_log_summary.csv", "dl_weekly_summary"),
+                    ("monthly_summary", "monthly_log_summary.csv", "dl_monthly_summary"),
+                    ("weekday_summary", "weekday_log_summary.csv", "dl_weekday_summary"),
+                    ("log_type_summary", "log_type_summary.csv", "dl_log_type_summary"),
+                ]:
+                    report_file_path = _report_file_path(report_dir, file_key, default_name)
+                    if report_file_path is not None:
+                        _render_download_button(report_file_path, default_name, "text/csv", download_key)
+
+    with tab_manual:
+        manual_df = history_df[history_df["log_type"] == "manual"].copy() if not history_df.empty else pd.DataFrame()
+        _render_single_log_tab(manual_df, "수동 입력 점수 확인 로그", "아직 저장된 수동 번호 점수 로그가 없습니다.", current_target_round=current_prediction_round, log_token=log_token)
+
+
+def _render_data_gate(project_dir: Path):
+    data_access_granted = bool(st.session_state.get("data_access_granted", False))
+    gate_title = "원본 데이터 보기 해제" if data_access_granted else "원본 데이터 접근 확인"
+    gate_desc = (
+        "비밀번호를 입력하면 원본 데이터 보기 권한이 해제됩니다."
+        if data_access_granted
+        else "비밀번호를 입력하면 원본 데이터 내용을 확인할 수 있습니다."
+    )
+    submit_label = "원본 데이터 보기 해제" if data_access_granted else "원본 데이터 열기"
+
+    st.markdown(
+        f"""
+        <div class="soft-panel">
+            <h4>{gate_title}</h4>
+            <p>{gate_desc}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.form("data_check_password_form", clear_on_submit=True):
+        pw = st.text_input("원본 데이터 비밀번호", type="password", key="data_check_password_input")
+        submitted = st.form_submit_button(submit_label, use_container_width=True)
+
+        if submitted:
+            if pw == DATA_CHECK_PASSWORD:
+                st.session_state.data_access_granted = not data_access_granted
+                st.session_state.show_data_gate = False
+                st.session_state.view = "show_data" if st.session_state.data_access_granted else ""
+                _persist_runtime_state(project_dir)
+                st.rerun()
+            elif pw:
+                st.error("비밀번호가 올바르지 않습니다.")
+            else:
+                st.warning("원본 데이터 비밀번호를 먼저 입력해 주세요.")
+
+
+def main():
+    st.set_page_config(page_title=TITLE, layout="wide")
+    _log_mem("main() 시작 (rerun)")
+    disable_copy()
+
+    # [성능/UX] 로컬 우선 렌더: 첫 세션 로드에선 원격 동기화(네트워크 cold-start 30초~1분)를
+    # 미뤄 로그인/홈 화면을 즉시 띄운다. 렌더가 끝난 뒤(아래) 실제 동기화 후 새로고침한다.
+    _needs_initial_remote_sync = not st.session_state.get("_initial_remote_sync_done", False)
+    set_defer_remote_bootstrap(_needs_initial_remote_sync)
+
+    # 필수 시크릿 미설정 경고 (관리자용)
+    missing_secrets = _validate_secrets()
+    if missing_secrets:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "필수 패스워드가 설정되지 않았습니다. st.secrets 또는 환경변수를 설정해 주세요: %s",
+            ", ".join(missing_secrets),
+        )
+
+    project_dir = _resolve_data_dir()
+    _init_session_state(project_dir)
+    # lotto.xlsx는 항상 소스 디렉터리에서 읽음 (읽기전용이어도 됨)
+    excel_path = _project_root / "lotto.xlsx"
+    if not excel_path.exists():
+        excel_path = project_dir / "lotto.xlsx"
+    _, report_dir = ensure_runtime_dirs(project_dir)
+
+    if not st.session_state.auth:
+        st.markdown(
+            f"""
+            <div class="hero-card">
+                <div class="hero-eyebrow">보안 입장</div>
+                <h1 class="hero-title">{TITLE}</h1>
+                <p class="hero-subtitle">입장 비밀번호를 입력하면 분석 대시보드로 이동합니다.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        today_pw = _today_password()
+        pw_in = st.text_input("입장 비밀번호", type="password")
+        if st.button("입장하기", use_container_width=True) or (pw_in == today_pw):
+            if pw_in == today_pw:
+                st.session_state.auth = True
+                st.rerun()
+            elif pw_in:
+                st.error("입장 비밀번호가 올바르지 않습니다.")
+        return
+
+    if not os.path.exists(excel_path):
+        st.error("lotto.xlsx 파일이 필요합니다.")
+        return
+    
+    # 스케줄된 자동 로그 생성 확인 및 실행 (standalone_scheduler.py에서 독립 실행)
+    # 웹 로그인 없이 자동 실행되므로 여기서는 호출하지 않음
+    # [성능] 세션당 1회 + 프로세스 단위 최소 간격으로만 스크래핑(과도한 재실행/재빌드 방지)
+    # 로컬 우선 렌더 첫 패스에선 스크래핑도 미루고(아래 동기화 블록에서 수행) 즉시 화면을 띄운다.
+    if not _needs_initial_remote_sync:
+        _maybe_refresh_source_data(excel_path)
+    
+    excel_cache_token = _file_cache_token(excel_path)
+    predictor = _get_cached_predictor(str(excel_path), excel_cache_token)
+    current_source_round = _current_source_round(excel_path, excel_cache_token, predictor)
+
+    _render_hero(predictor)
+
+    _render_home_guide_studio()
+
+    # ── AI 추천 적중률 대시보드 ──────────────────────────────────────
+    # [성능/구조] 1단계 페이지 분리: 로그분석(analysis) 페이지에서는 홈 전용
+    # 무거운 섹션(AI 적중률 대시보드)을 렌더하지 않아 그 페이지의 재실행을 가볍게 한다.
+    # (다른 뷰·홈에서는 기존과 동일하게 표시. 되돌리기 쉬운 최소 변경.)
+    _active_view = st.session_state.get("view", "")
+    if _active_view != "analysis":
+        st.markdown("<hr style='margin: 24px 0; border-color: rgba(125,211,252,0.15);'>", unsafe_allow_html=True)
+
+        dashboard_tab1, dashboard_tab2 = st.tabs(["AI 추천 적중률 현황", "상세 분석"])
+
+        with dashboard_tab1:
+            try:
+                render_performance_dashboard(str(project_dir))
+            except Exception as e:
+                st.warning(f"대시보드 데이터를 불러오는 중입니다: {e}")
+
+        with dashboard_tab2:
+            st.markdown("### 🔍 상세 분석 그래프")
+            # 상세 분석 관련 코드 추가 가능
+            st.info("상세 분석 기능은 분석 데이터 누적 후 활성화됩니다.")
+
+    refresh_notice = st.session_state.pop("source_data_refresh_notice", None)
+    if isinstance(refresh_notice, dict) and refresh_notice.get("message"):
+        level = str(refresh_notice.get("level") or "info").lower()
+        if level == "success":
+            st.success(refresh_notice["message"])
+        elif level == "error":
+            st.error(refresh_notice["message"])
+        else:
+            st.info(refresh_notice["message"])
+
+    p_lock = (not st.session_state.unlock_granted) and st.session_state.counts["prediction"] >= LOCK_LIMIT
+    pr_lock = (not st.session_state.unlock_granted) and st.session_state.counts["probability"] >= LOCK_LIMIT
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        st.markdown("<div id='pattern-action-anchor'></div>", unsafe_allow_html=True)
+        _render_feature_card(
+            "feature-green",
+            "추천 시작",
+            "패턴 추천 받기",
+            "포지션·gap·pair 가중치를 함께 반영합니다. 처음이라면 이 버튼부터 눌러 보세요.",
+        )
+        if st.button(
+            "패턴 추천 바로 받기" + (" (잠김)" if p_lock else ""),
+            key="home_predict_btn",
+            disabled=p_lock,
+            use_container_width=True,
+            type="primary",
+        ):
+            with st.spinner("분석 중입니다. 패턴 가중치 기반 추천을 계산하고 있습니다..."):
+                runtime_simulation_count = _current_simulation_count()
+                results = predictor.predict(simulation_count=runtime_simulation_count)
+                if not st.session_state.unlock_granted:
+                    st.session_state.counts["prediction"] += 1
+                st.session_state.predict_results = results
+                log_prediction_results(
+                    base_dir=project_dir,
+                    excel_path=excel_path,
+                    predictor=predictor,
+                    results=results,
+                    log_type="prediction",
+                    simulation_count=runtime_simulation_count,
+                )
+                _persist_runtime_state(project_dir)
+            st.session_state.view = "predict"
+            st.session_state.show_data_gate = False
+        if st.session_state.unlock_granted:
+            st.caption("즉시 실행 가능합니다.")
+        else:
+            st.caption("잠김 상태가 되면 우측 하단의 사용 제한 해제 메뉴를 이용하세요.")
+
+    with action_col2:
+        st.markdown("<div id='probability-action-anchor'></div>", unsafe_allow_html=True)
+        _render_feature_card(
+            "feature-purple",
+            "비교 추천",
+            "확률 추천 받기",
+            "마르코프 전이확률에 시뮬레이션 규모와 지아넬라 패턴 적합도를 반영합니다.",
+        )
+        if st.button(
+            "확률 추천 바로 받기" + (" (잠김)" if pr_lock else ""),
+            key="home_probability_btn",
+            disabled=pr_lock,
+            use_container_width=True,
+            type="primary",
+        ):
+            with st.spinner("분석 중입니다. 확률 기반 추천을 계산하고 있습니다..."):
+                runtime_simulation_count = _current_simulation_count()
+                results = predictor.predict_probability_only(simulation_count=runtime_simulation_count)
+                if not st.session_state.unlock_granted:
+                    st.session_state.counts["probability"] += 1
+                st.session_state.probability_results = results
+                log_prediction_results(
+                    base_dir=project_dir,
+                    excel_path=excel_path,
+                    predictor=predictor,
+                    results=results,
+                    log_type="probability",
+                    simulation_count=runtime_simulation_count,
+                )
+                _persist_runtime_state(project_dir)
+            st.session_state.view = "prob_only"
+            st.session_state.show_data_gate = False
+        if st.session_state.unlock_granted:
+            st.caption("즉시 실행 가능합니다.")
+        else:
+            st.caption("잠김 상태가 되면 우측 하단의 사용 제한 해제 메뉴를 이용하세요.")
+
+    st.markdown(
+        """
+        <div class="section-shell">
+            <h3>수동 번호 점수 확인</h3>
+            <p>직접 고른 번호 6개를 입력하면 입력 순서 점수, 최적 순서 점수, 확률 점수를 같은 기준으로 다시 비교할 수 있습니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    pending_manual_numbers = st.session_state.pop("pending_manual_numbers", None)
+    if pending_manual_numbers:
+        for idx, number in enumerate(pending_manual_numbers):
+            st.session_state[f"mn{idx}"] = int(number)
+    with st.form("manual_score_form", clear_on_submit=False):
+        top_inputs = st.columns(3)
+        bottom_inputs = st.columns(3)
+        input_cols = [*top_inputs, *bottom_inputs]
+        m_nums = [
+            input_cols[i].number_input(f"번호 {i+1}", 1, 45, value=None, key=f"mn{i}")
+            for i in range(6)
+        ]
+        button_col1, button_col2 = st.columns(2)
+        with button_col1:
+            solo_submitted = st.form_submit_button(
+                "나혼자 당첨",
+                use_container_width=True,
+            )
+        with button_col2:
+            submitted = st.form_submit_button(
+                "점수 계산하기",
+                use_container_width=True,
+            )
+
+        if solo_submitted:
+            current_manual_numbers = [st.session_state.get(f"mn{i}") for i in range(6)]
+            previous_numbers = [int(n) for n in current_manual_numbers] if all(n is not None for n in current_manual_numbers) else None
+            generated_numbers = _generate_anti_pattern_manual_numbers(excel_path=excel_path, previous_numbers=previous_numbers)
+            result = predictor.score_manual_combination(generated_numbers)
+            st.session_state.pending_manual_numbers = generated_numbers
+            st.session_state.manual_result = result
+            st.session_state.manual_logged = False
+            # [의도] '나혼자 당첨'은 번호를 채우고 점수만 미리 보여줄 뿐,
+            # 수동 점수 로그에는 기록하지 않는다. 실제 로깅은 사용자가
+            # '점수 계산하기'를 눌렀을 때만 수행된다(자동 생성 번호로 히스토리 오염 방지).
+            st.session_state.view = "manual"
+            st.session_state.show_data_gate = False
+            st.rerun()
+
+        if submitted:
+            if not all(n is not None for n in m_nums):
+                st.warning("6개의 번호를 모두 입력해 주세요.")
+            elif len(set(m_nums)) != 6:
+                st.warning("중복 없는 6개의 번호를 입력하세요.")
+            else:
+                result = predictor.score_manual_combination(m_nums)
+                st.session_state.manual_result = result
+                log_manual_score(
+                    base_dir=project_dir,
+                    excel_path=excel_path,
+                    predictor=predictor,
+                    numbers=m_nums,
+                    result=result,
+                )
+                st.session_state.manual_logged = True
+                _persist_runtime_state(project_dir)
+                st.session_state.view = "manual"
+                st.session_state.show_data_gate = False
+
+    render_ai_recommendation_section(project_dir)
+
+    
+    row2_col1, row2_col2, row2_col3 = st.columns(3)
+    with row2_col1:
+        st.markdown(
+            """
+            <div class="soft-panel">
+                <h4>로그 분석 · 히스토리</h4>
+                <p>저장된 추천 이력과 적중 매칭, 임계값 변화를 한 번에 확인합니다.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("로그 분석 · 히스토리", key="home_analysis_btn", use_container_width=True):
+            with st.spinner("분석 중입니다. 분석 · 히스토리를 생성하고 있습니다..."):
+                st.session_state.analysis_summary = _get_fresh_analysis_summary(
+                    project_dir,
+                    excel_path,
+                    excel_cache_token,
+                    predictor,
+                    force_refresh=False,
+                )
+            st.session_state.view = "analysis"
+            st.session_state.show_data_gate = False
+    with row2_col2:
+        st.markdown(
+            """
+            <div class="soft-panel">
+                <h4>원본 데이터</h4>
+                <p>비밀번호를 입력하면 lotto.xlsx 원본 데이터를 확인하고 내려받을 수 있습니다.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("원본 데이터 보기", key="home_data_btn", use_container_width=True):
+            with st.spinner("최신 회차를 확인하고 원본 데이터를 준비하고 있습니다..."):
+                _refresh_source_data(excel_path)
+            if st.session_state.data_access_granted:
+                st.session_state.view = "show_data"
+                st.session_state.show_data_gate = False
+            else:
+                st.session_state.show_data_gate = True
+                st.session_state.view = "data_gate"
+            st.rerun()
+    with row2_col3:
+        limit_status_title = "사용 제한" if st.session_state.unlock_granted else "사용 제한 해제"
+        limit_status_desc = (
+            "현재는 무제한 상태입니다. 다시 제한 모드로 전환하려면 비밀번호를 입력해 주세요."
+            if st.session_state.unlock_granted
+            else "패턴 추천/확률 추천의 3회 제한을 해제하려면 비밀번호를 입력해 주세요."
+        )
+        st.markdown(
+            f"""
+            <div class="soft-panel">
+                <h4>{limit_status_title}</h4>
+                <p>{limit_status_desc}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button(limit_status_title, key="home_unlock_btn", use_container_width=True):
+            st.session_state.unlock_mode = not st.session_state.unlock_mode
+
+
+    if st.session_state.unlock_mode:
+        limit_toggle_title = "🔒 사용 제한 적용" if st.session_state.unlock_granted else "🔓 사용 제한 해제"
+        limit_toggle_desc = (
+            "현재 무제한 상태입니다. 비밀번호가 맞으면 제한 모드로 다시 전환됩니다."
+            if st.session_state.unlock_granted
+            else "현재 제한 모드입니다. 비밀번호가 맞으면 무제한 상태로 전환됩니다."
+        )
+        limit_submit_label = "사용 제한 적용" if st.session_state.unlock_granted else "사용 제한 해제"
+        password_label = "비밀번호 입력"
+        st.markdown(
+            f"""
+            <div class="unlock-shell">
+                <div class="title">{limit_toggle_title}</div>
+                <div class="desc">{limit_toggle_desc}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.form("unlock_form", clear_on_submit=True):
+            ent_code = st.text_input(password_label, type="password", key="unlock_input_field")
+            unlock_submitted = st.form_submit_button(limit_submit_label, use_container_width=True)
+
+            if unlock_submitted:
+                if ent_code == UNLOCK_PASSWORD:
+                    st.session_state.counts["prediction"] = 0
+                    st.session_state.counts["probability"] = 0
+                    st.session_state.unlock_granted = not st.session_state.unlock_granted
+                    st.session_state.unlock_mode = False
+                    _persist_runtime_state(project_dir)
+                    if st.session_state.unlock_granted:
+                        st.success("사용 제한이 해제되었습니다. 패턴 추천과 확률 추천을 무제한으로 사용할 수 있습니다.")
+                    else:
+                        st.success("사용 제한이 다시 적용되었습니다. 패턴 추천과 확률 추천은 각각 3회씩 사용할 수 있습니다.")
+                    st.rerun()
+                elif ent_code:
+                    st.error("비밀번호가 올바르지 않습니다.")
+
+    res = st.container()
+    v = st.session_state.get("view", "")
+
+    if v == "data_gate" and not st.session_state.data_access_granted:
+        with res:
+            _render_data_gate(project_dir)
+
+    elif v == "show_data":
+        with res:
+            res.markdown("### lotto.xlsx 원본 데이터")
+            if st.session_state.data_access_granted:
+                control_col1, control_col2, control_col3 = st.columns([2, 2, 1])
+                with control_col2:
+                    if st.button("최신 데이터 다시 확인", key="refresh_show_data_btn", use_container_width=True):
+                        with st.spinner("최신 회차를 다시 확인하고 있습니다..."):
+                            _refresh_source_data(excel_path)
+                        st.rerun()
+                with control_col3:
+                    if st.button("원본 데이터 보기 해제", key="data_access_toggle_btn", use_container_width=True):
+                        st.session_state.show_data_gate = not st.session_state.show_data_gate
+                if st.session_state.show_data_gate:
+                    _render_data_gate(project_dir)
+            if not st.session_state.data_access_granted:
+                res.warning("원본 데이터 확인 권한이 없습니다.")
+            else:
+                if not excel_path.exists():
+                    res.error(f"파일을 찾을 수 없습니다: {excel_path.name}")
+                else:
+                    try:
+                        df_display = _read_excel_cached(str(excel_path), excel_cache_token).copy()
+                        # 컬럼 필터링 안전하게 처리
+                        cols_to_drop = ["수집페이지", "출처"]
+                        existing_drops = [c for c in cols_to_drop if c in df_display.columns]
+                        if existing_drops:
+                            df_display = df_display.drop(columns=existing_drops)
+                        
+                        latest_round_display = "-"
+                        if "회차" in df_display.columns and not df_display.empty:
+                            latest_round_display = f"{int(pd.to_numeric(df_display['회차'], errors='coerce').dropna().max())}회"
+
+                        _render_stats_grid(
+                            res,
+                            [
+                                ("현재 데이터 행 수", f"{len(df_display):,}", "lotto.xlsx에 들어 있는 전체 행 수입니다."),
+                                ("최신 회차", latest_round_display, "원본 데이터 보기 진입 시점 기준으로 다시 확인한 최신 회차입니다."),
+                                ("보안 상태", "인증 완료", "원본 데이터 보기 권한이 확인된 상태입니다."),
+                            ],
+                        )
+
+                        res.dataframe(df_display, use_container_width=True, hide_index=True)
+                        _render_download_button(excel_path, "lotto.xlsx 다운로드", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "dl_excel_btn")
+                    except Exception as e:
+                        res.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
+
+    elif v == "summary":
+        pass
+
+    elif v == "predict":
+        with res:
+            results = st.session_state.get("predict_results") or []
+            _render_result_block(
+                res,
+                title="",
+                intro="포지션, gap, pair 시너지를 함께 반영한 상위 후보입니다.",
+                results=results,
+                predictor=predictor,
+                probability_only=False,
+            )
+            res.success("패턴 추천 결과를 logs/prediction_log.jsonl 파일에 저장했습니다.")
+
+    elif v == "prob_only":
+        with res:
+            results = st.session_state.get("probability_results") or []
+            _render_result_block(
+                res,
+                title="",
+                intro="전체 빈도와 구간 확률에 집중한 상위 후보입니다.",
+                results=results,
+                predictor=predictor,
+                probability_only=True,
+            )
+            res.success("확률 추천 결과를 logs/probability_log.jsonl 파일에 저장했습니다.")
+
+    elif v == "manual":
+        with res:
+            ret = st.session_state.get("manual_result")
+            if ret:
+                _sharing_colors = {"낮음": "#1a7f37", "보통": "#b7791f", "높음": "#c0392b"}
+                _sg = ret.get("sharing_grade")
+                _sharing_html = ""
+                if _sg:
+                    _color = _sharing_colors.get(_sg, "#555")
+                    _reasons = " · ".join(ret.get("sharing_reasons", [])[:3])
+                    _sharing_html = (
+                        f'<p><b>공동당첨 위험도</b> : '
+                        f'<span style="color:{_color};font-weight:700">{_sg}</span> '
+                        f'({ret.get("sharing_risk_score", 0)}) '
+                        f'<span style="opacity:.7;font-size:.9em">— 당첨 확률과 무관, 당첨 시 분배 측면</span></p>'
+                        f'<p style="opacity:.75;font-size:.9em">{_reasons}</p>'
+                    )
+                # 비인기 점수(0~100, 높을수록 남들과 덜 겹침 = 배당 분할 유리, 확률과는 무관)
+                _unpop_html = ""
+                try:
+                    from popularity_score import score_breakdown as _pop_bd
+                    _ub = _pop_bd(ret["sorted"])
+                    _uscore = _ub["unpopularity_score"]
+                    _ucolor = "#1a7f37" if _uscore >= 70 else ("#b7791f" if _uscore >= 40 else "#c0392b")
+                    _top_pen = sorted(
+                        ((k, v) for k, v in _ub["penalties"].items() if v > 0),
+                        key=lambda kv: kv[1], reverse=True,
+                    )[:3]
+                    _pen_label = {
+                        "birthday": "생일대(1~31) 편중", "month": "월/일(1~12) 편중",
+                        "popular": "인기·행운수", "pretty_round": "예쁜수·라운드수",
+                        "low_sum": "합계 낮음", "high_deficit": "고번호대 부족",
+                        "consecutive": "연속수", "decade_cluster": "십의자리 쏠림",
+                    }
+                    _reason_txt = " · ".join(_pen_label.get(k, k) for k, _ in _top_pen)
+                    _unpop_html = (
+                        f'<p><b>비인기 점수</b> : '
+                        f'<span style="color:{_ucolor};font-weight:700">{_uscore}</span> / 100 '
+                        f'<span style="opacity:.7;font-size:.9em">— 높을수록 남들과 덜 겹침(당첨 시 배당 유리), 확률과는 무관</span></p>'
+                        + (f'<p style="opacity:.75;font-size:.9em">감점 요인: {_reason_txt}</p>' if _reason_txt else "")
+                    )
+                except Exception:
+                    _unpop_html = ""
+                res.markdown(
+                    f"""
+                    <div class="result-card">
+                        <h4>입력 번호 { _format_number_sequence(ret['sorted']) }</h4>
+                        <div class="number-badges">{_format_ball_badges(ret['sorted'])}</div>
+                        <p><b>입력 순서</b> : {_format_number_sequence(ret.get('input_order', ret['sorted']))}</p>
+                        <p><b>입력 순서 점수</b> : {ret.get('input_order_score', ret['best_score'])}</p>
+                        <p><b>최적 순서</b> : {_format_number_sequence(ret.get('best_order', ret['sorted']))}</p>
+                        <p><b>최고 순서 점수</b> : {ret['best_score']}</p>
+                        <p><b>평균 점수</b> : {ret['average_score']}</p>
+                        <p><b>확률 점수</b> : {ret['probability_score']}</p>
+                        <p><b>평균 gap 계수</b> : {predictor.average_gap_factor(ret['sorted']):.6f}</p>
+                        <p><b>평균 확률 가중치</b> : {predictor.average_probability_weight(ret['sorted']):.6f}</p>
+                        {_unpop_html}
+                        {_sharing_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                _render_number_detail_cards(res, predictor, ret["sorted"])
+                if st.session_state.get("manual_logged"):
+                    res.success("수동 점수 결과를 logs/manual_score_log.jsonl 파일에 저장했습니다.")
+                else:
+                    res.info("번호를 채웠습니다. '점수 계산하기'를 누르면 기록에 저장됩니다.")
+
+    elif v == "analysis":
+        with res:
+            summary = _get_fresh_analysis_summary(project_dir, excel_path, excel_cache_token, predictor)
+            _render_analysis_view(
+                summary,
+                project_dir,
+                report_dir,
+                predictor,
+                excel_path,
+                excel_cache_token,
+                current_source_round,
+            )
+
+    # [성능/UX] 로컬 우선 렌더 완료 → 이제 원격 동기화를 수행하고 새로고침한다.
+    # 화면(로그인/홈/뷰)은 이미 로컬 데이터로 그려졌으므로, 사용자는 30초~1분의
+    # 네트워크 cold-start 동안 빈 화면을 기다리지 않고 내용을 바로 볼 수 있다.
+    # 동기화가 끝나면 rerun 되어 최신 데이터로 갱신된다. (_initial_remote_sync_done
+    # 플래그로 세션당 1회만 수행 → 재실행 루프 없음)
+    if _needs_initial_remote_sync and st.session_state.get("auth"):
+        st.session_state["_initial_remote_sync_done"] = True
+        set_defer_remote_bootstrap(False)
+        try:
+            with st.spinner("최신 데이터를 동기화하는 중입니다..."):
+                bootstrap_remote_runtime_if_needed(str(project_dir))
+                _maybe_refresh_source_data(excel_path)
+        except Exception as _sync_exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"초기 원격 동기화 중 오류: {_sync_exc}")
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,124 @@
+{
+  "timestamp": "2026-06-01T01:41:20.423550",
+  "recommendations": [
+    {
+      "rank": 1,
+      "numbers": [
+        6,
+        11,
+        13,
+        16,
+        35,
+        43
+      ],
+      "score": 100.0,
+      "ac": 9,
+      "sum": 124,
+      "odd_even": "4:2",
+      "hot_count": 4,
+      "cold_count": 1
+    },
+    {
+      "rank": 2,
+      "numbers": [
+        11,
+        12,
+        16,
+        35,
+        43,
+        45
+      ],
+      "score": 100.0,
+      "ac": 10,
+      "sum": 162,
+      "odd_even": "4:2",
+      "hot_count": 4,
+      "cold_count": 1
+    },
+    {
+      "rank": 3,
+      "numbers": [
+        3,
+        7,
+        10,
+        11,
+        35,
+        38
+      ],
+      "score": 100.0,
+      "ac": 7,
+      "sum": 104,
+      "odd_even": "4:2",
+      "hot_count": 4,
+      "cold_count": 1
+    },
+    {
+      "rank": 4,
+      "numbers": [
+        4,
+        10,
+        12,
+        16,
+        33,
+        35
+      ],
+      "score": 100.0,
+      "ac": 7,
+      "sum": 110,
+      "odd_even": "2:4",
+      "hot_count": 4,
+      "cold_count": 2
+    },
+    {
+      "rank": 5,
+      "numbers": [
+        3,
+        6,
+        26,
+        32,
+        35,
+        37
+      ],
+      "score": 100.0,
+      "ac": 8,
+      "sum": 139,
+      "odd_even": "3:3",
+      "hot_count": 4,
+      "cold_count": 2
+    }
+  ],
+  "patterns": {
+    "hot_numbers": [
+      3,
+      35,
+      16,
+      6,
+      13,
+      30,
+      38,
+      45,
+      33,
+      15
+    ],
+    "cold_numbers": [
+      26,
+      41,
+      23,
+      32,
+      4,
+      34,
+      10,
+      39,
+      17,
+      25
+    ],
+    "ac_range": [
+      7,
+      11
+    ],
+    "sum_range": [
+      100,
+      180
+    ]
+  }
+}

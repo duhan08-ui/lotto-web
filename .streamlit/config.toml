@@ -1,0 +1,11 @@
+# [v99] 라이트(에디토리얼 페이퍼) 테마 고정.
+# base="light" 로 네이티브 위젯(데이터프레임·날짜 달력 등)까지 라이트로 통일.
+[theme]
+base = "light"
+primaryColor = "#2F5B53"
+backgroundColor = "#F7F5F0"
+secondaryBackgroundColor = "#FFFEFB"
+textColor = "#201E1A"
+
+[client]
+showErrorDetails = true
