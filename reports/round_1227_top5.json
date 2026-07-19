@@ -1,0 +1,149 @@
+{
+  "generated_at": "2026-06-02T10:50:33.148091+09:00",
+  "source_round": 1226,
+  "target_round": 1227,
+  "pattern_top5": [
+    {
+      "rank": 1,
+      "numbers": [
+        4,
+        8,
+        12,
+        31,
+        32,
+        41
+      ],
+      "score": 582.6913,
+      "ensemble_score": 14.977534,
+      "entropy_score": 0.8262
+    },
+    {
+      "rank": 2,
+      "numbers": [
+        9,
+        18,
+        23,
+        24,
+        39,
+        45
+      ],
+      "score": 564.1653,
+      "ensemble_score": 14.45757,
+      "entropy_score": 0.8262
+    },
+    {
+      "rank": 3,
+      "numbers": [
+        6,
+        8,
+        14,
+        28,
+        34,
+        41
+      ],
+      "score": 550.3886,
+      "ensemble_score": 14.143261,
+      "entropy_score": 0.8262
+    },
+    {
+      "rank": 4,
+      "numbers": [
+        7,
+        16,
+        18,
+        23,
+        36,
+        39
+      ],
+      "score": 544.1775,
+      "ensemble_score": 13.746786,
+      "entropy_score": 0.9697
+    },
+    {
+      "rank": 5,
+      "numbers": [
+        10,
+        16,
+        23,
+        24,
+        25,
+        38
+      ],
+      "score": 543.819,
+      "ensemble_score": 14.03329,
+      "entropy_score": 0.6284
+    }
+  ],
+  "probability_top5": [
+    {
+      "rank": 1,
+      "numbers": [
+        3,
+        16,
+        18,
+        20,
+        35,
+        43
+      ],
+      "score": -2.4098,
+      "ensemble_score": 10.89829,
+      "entropy_score": 0.9697
+    },
+    {
+      "rank": 2,
+      "numbers": [
+        5,
+        10,
+        12,
+        24,
+        33,
+        40
+      ],
+      "score": -2.4453,
+      "ensemble_score": 12.402141,
+      "entropy_score": 0.9697
+    },
+    {
+      "rank": 3,
+      "numbers": [
+        5,
+        16,
+        18,
+        25,
+        37,
+        40
+      ],
+      "score": -2.451,
+      "ensemble_score": 11.612353,
+      "entropy_score": 0.8262
+    },
+    {
+      "rank": 4,
+      "numbers": [
+        8,
+        10,
+        19,
+        29,
+        31,
+        42
+      ],
+      "score": -2.4599,
+      "ensemble_score": 12.151689,
+      "entropy_score": 0.9697
+    },
+    {
+      "rank": 5,
+      "numbers": [
+        6,
+        11,
+        17,
+        29,
+        36,
+        44
+      ],
+      "score": -2.4614,
+      "ensemble_score": 11.630367,
+      "entropy_score": 0.8262
+    }
+  ]
+}

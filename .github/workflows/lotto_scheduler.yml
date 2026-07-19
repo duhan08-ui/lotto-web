@@ -1,0 +1,102 @@
+name: 로또 자동 스케줄러
+
+on:
+  schedule:
+    # 토요일: 13:30 UTC = 22:30 KST  (당첨번호 수집 + 성능 분석)
+    - cron: '30 13 * * 6'
+  # 일일(daily) 루틴은 외부 cron-job.org 가 08:00 KST 에 workflow_dispatch 로 정확히 트리거한다.
+  # GitHub schedule 의 일일 cron 은 지연이 심하고(09:00 예약이 13:10 실행) cron-job.org 와
+  # 이중 실행되어 하루 300→600 중복을 유발하므로 제거했다.
+  workflow_dispatch:
+    # 수동 실행 또는 cron-job.org에서 자동 트리거
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily       # 오전 9시 루틴 (로그 생성 + 성능 분석)
+          - saturday    # 토요일 루틴 (당첨번호 수집 + 성능 분석)
+          - full        # 전체 실행 (위 두 가지 모두)
+
+jobs:
+  scheduler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # 갱신된 lotto.xlsx 커밋용
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 실행 모드 결정
+        id: mode
+        run: |
+          MANUAL_MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MANUAL_MODE" ]; then
+            # schedule 트리거: KST 기준 토요일 21시 이후면 saturday, 그 외 daily
+            DOW_KST=$(TZ=Asia/Seoul date +%u)   # 1=월 ... 6=토 7=일
+            HOUR_KST=$(TZ=Asia/Seoul date +%H)
+            if [ "$DOW_KST" = "6" ] && [ "$HOUR_KST" -ge 21 ]; then
+              MANUAL_MODE="saturday"
+            else
+              MANUAL_MODE="daily"
+            fi
+          fi
+          echo "mode=$MANUAL_MODE" >> $GITHUB_OUTPUT
+          echo "▶ 실행 모드: $MANUAL_MODE"
+
+      - name: Supabase 시크릿 확인 (미설정 시 경고)
+        run: |
+          if [ -z "${{ secrets.LOTTO_SUPABASE_URL }}" ] || [ -z "${{ secrets.LOTTO_SUPABASE_KEY }}" ]; then
+            echo "::warning::LOTTO_SUPABASE_URL/KEY 시크릿이 설정되지 않았습니다. 로그가 Supabase에 저장되지 않고 로컬 폴백만 동작합니다. (Settings > Secrets and variables > Actions 에서 설정)"
+          else
+            echo "✅ Supabase 시크릿 확인됨"
+          fi
+
+      - name: 오전 9시 루틴 — 로그 생성 + 성능 분석
+        if: steps.mode.outputs.mode == 'daily' || steps.mode.outputs.mode == 'full'
+        env:
+          LOTTO_SUPABASE_URL: ${{ secrets.LOTTO_SUPABASE_URL }}
+          LOTTO_SUPABASE_KEY: ${{ secrets.LOTTO_SUPABASE_KEY }}
+          LOTTO_PERSISTENCE_BACKEND: supabase
+        run: |
+          echo "=== 오전 9시 로그 생성 시작 ==="
+          python3 gha_daily.py
+          echo "=== 완료 ==="
+
+      - name: 토요일 루틴 — 당첨번호 수집 + 성능 분석
+        if: steps.mode.outputs.mode == 'saturday' || steps.mode.outputs.mode == 'full'
+        env:
+          LOTTO_SUPABASE_URL: ${{ secrets.LOTTO_SUPABASE_URL }}
+          LOTTO_SUPABASE_KEY: ${{ secrets.LOTTO_SUPABASE_KEY }}
+          LOTTO_PERSISTENCE_BACKEND: supabase
+        run: |
+          echo "=== 토요일 루틴 시작 ==="
+          python3 gha_saturday.py
+          echo "=== 완료 ==="
+
+      - name: 갱신된 lotto.xlsx 커밋
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lotto.xlsx
+          if git diff --cached --quiet; then
+            echo "lotto.xlsx 변경 없음 - 커밋 생략"
+          else
+            git commit -m "chore: lotto.xlsx 당첨번호 자동 갱신"
+            git push
+            echo "lotto.xlsx 갱신분 커밋 완료"
+          fi

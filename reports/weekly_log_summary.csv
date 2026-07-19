@@ -1,0 +1,5 @@
+﻿week_kst,log_type,logs,unique_runs,unique_target_rounds,scored_logs,score_coverage,avg_score,median_score,score_std,best_score,p25_score,p75_score,avg_gap_factor,avg_probability_weight
+2026-W27,manual,2,2,1,2,1.0,2.3393,2.3393,1.4862,3.8255,1.5962,3.0824,0.98,0.9375
+2026-W24,manual,105,100,1,105,1.0,1.1957,1.19,2.8582,6.7145,-0.9091,3.6181,0.992,1.0011
+2026-W24,prediction,105,1,1,105,1.0,417.7967,435.0835,93.9169,481.6133,429.8089,443.4593,0.9844,1.0063
+2026-W24,probability,105,1,1,105,1.0,-2.5092,-2.696,0.7156,0.6774,-2.7344,-2.6052,0.9882,1.0013
